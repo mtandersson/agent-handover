@@ -17,8 +17,11 @@ The project is currently a minimal Rust CLI:
 
 - `src/main.rs`: current command entry point and its unit tests.
 - `src/config.rs`: private XDG host configuration and path contracts.
+- `src/discovery.rs`: webhook signal filtering, authoritative refetch policy,
+  and the downstream discovery boundary.
 - `src/enrollment.rs`: fakeable webhook-token enrollment and private file storage.
-- `src/http.rs`: loopback HTTP serving, webhook authentication, and fake dispatch boundary.
+- `src/http.rs`: loopback HTTP serving, webhook authentication, and async dispatch boundary.
+- `src/notion.rs`: fakeable Notion task refetch adapter and production HTTP client.
 - `flake.nix` and `Cargo.toml`: reproducible toolchain, checks, and package
   metadata.
 - `.github/workflows`: pull-request validation and automated releases.
