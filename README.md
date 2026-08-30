@@ -6,11 +6,11 @@ a shared task queue and audit journal while keeping execution policy, secrets,
 and durable launch state on one private host.
 
 The repository contains the Rust CLI, private host configuration foundation,
-webhook-token enrollment, authenticated webhook HTTP intake, and build and
-release tooling. `serve` exposes the configured health and webhook routes;
-authenticated events currently stop at a dispatch boundary and do not contact
-Notion or launch Codex yet. Follow the [roadmap](#roadmap) for the remaining
-implementation sequence.
+webhook-token enrollment, authenticated webhook HTTP intake, authoritative
+Notion task refetching, and build and release tooling. `serve` exposes the
+configured health and webhook routes and forwards only currently eligible task
+discoveries to the orchestration boundary; it does not enqueue or launch Codex
+yet. Follow the [roadmap](#roadmap) for the remaining implementation sequence.
 
 ## Intended capabilities
 
@@ -97,6 +97,19 @@ from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
 signals: they can be delayed, duplicated, or delivered out of order, as
 described by [Notion's event-delivery contract][notion-delivery], so the runner
 refetches the page and reconciliation remains authoritative for discovery.
+Only page-created, page-content-updated, and page-properties-updated signals
+whose event parent names the configured task data source are considered. The
+runner then retrieves the current page through the Notion API and independently
+confirms its parent, `Executor = Codex`, and `Status = Pending` before forwarding
+it. Page retrieval uses the `2026-03-11` Notion API contract. Duplicate event
+IDs are acknowledged without another refetch; unique events
+are not rejected by timestamp because an older delivery can still reveal newer
+authoritative state. The runner parses `last_edited_time` as an RFC 3339 instant
+and serializes discovery decisions per page, so the same or an older revision
+never follows a newer cached revision to the discovery boundary. The bounded
+revision cache still recognizes a later manual `Error -> Pending` revision even
+when the intermediate non-Pending webhook was not observed. Runner-owned
+transitions to `Running`, `Done`, or `Error` are ignored as feedback signals.
 
 Webhook request bodies are limited to 1 MiB and must arrive within five
 seconds. Oversized requests receive `413 Payload Too Large`; slow request bodies
@@ -104,6 +117,10 @@ receive `408 Request Timeout` without blocking health checks or other requests.
 The server admits at most 16 active connections. Excess connections are closed,
 each admitted connection has a ten-second whole-lifecycle deadline, and shutdown
 closes outstanding connections so partial requests cannot delay termination.
+Authenticated discovery is independently limited to 16 active event
+supervisors. Duplicate deliveries subscribe to their existing supervisor
+without consuming another slot, while excess unique events wait without
+claiming event or page state.
 
 Notion requires a public HTTPS webhook URL. A [locally managed Cloudflare
 Tunnel][cloudflare-tunnel] can route only the webhook path to the loopback-bound
@@ -203,7 +220,7 @@ The runner interface is:
 
 | Command | Target behavior |
 | --- | --- |
-| `agent-handover serve` | Serve the configured health route and authenticate Notion webhook JSON before dispatch; later reconcile and drain tasks sequentially |
+| `agent-handover serve` | Serve the health and webhook routes, authenticate events, refetch signaled tasks, and forward current eligible discoveries; later reconcile and drain tasks sequentially |
 | `agent-handover run-once` | Validate and expose configuration; later reconcile and drain eligible tasks once |
 | `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
 | `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |

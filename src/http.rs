@@ -15,6 +15,7 @@ use sha2::Sha256;
 use std::error::Error;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -54,15 +55,10 @@ impl Drop for ActiveConnection {
 }
 
 pub trait EventDispatcher: Send + Sync + 'static {
-    fn dispatch(&self, event: Value) -> Result<(), String>;
-}
-
-pub struct PendingEventDispatcher;
-
-impl EventDispatcher for PendingEventDispatcher {
-    fn dispatch(&self, _event: Value) -> Result<(), String> {
-        Ok(())
-    }
+    fn dispatch(
+        &self,
+        event: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 }
 
 struct HttpState<D> {
@@ -241,6 +237,7 @@ async fn endpoint<D: EventDispatcher>(
         &state,
         Some(signature),
     )
+    .await
     .into_response()
 }
 
@@ -261,7 +258,7 @@ fn single_signature(headers: &HeaderMap) -> Option<&str> {
     valid_signature_format(signature).then_some(signature)
 }
 
-fn handle<D: EventDispatcher>(
+async fn handle<D: EventDispatcher>(
     request: HttpRequest<'_>,
     state: &HttpState<D>,
     signature: Option<&str>,
@@ -287,7 +284,7 @@ fn handle<D: EventDispatcher>(
         Ok(event) => event,
         Err(_) => return response(StatusCode::BAD_REQUEST, "bad request\n"),
     };
-    match state.dispatcher.dispatch(event) {
+    match state.dispatcher.dispatch(event).await {
         Ok(()) => response(StatusCode::OK, "accepted\n"),
         Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "event dispatch failed\n"),
     }
@@ -357,9 +354,14 @@ mod tests {
     }
 
     impl EventDispatcher for RecordingDispatcher {
-        fn dispatch(&self, event: Value) -> Result<(), String> {
-            self.events.lock().unwrap().push(event);
-            Ok(())
+        fn dispatch(
+            &self,
+            event: Value,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push(event);
+                Ok(())
+            })
         }
     }
 
@@ -404,8 +406,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fake_handler_covers_paths_exact_bytes_and_authentication_order() {
+    #[tokio::test]
+    async fn fake_handler_covers_paths_exact_bytes_and_authentication_order() {
         let state = test_state();
         let empty = HeaderMap::new();
         assert_eq!(
@@ -413,7 +415,8 @@ mod tests {
                 request(&Method::GET, "/custom/health", &empty, b""),
                 &state,
                 None
-            ),
+            )
+            .await,
             response(StatusCode::OK, "ok\n")
         );
 
@@ -424,7 +427,8 @@ mod tests {
                 request(&Method::POST, "/custom/webhook", &empty, body),
                 &state,
                 Some(&signed)
-            ),
+            )
+            .await,
             response(StatusCode::OK, "accepted\n")
         );
         assert_eq!(state.dispatcher.events.lock().unwrap().len(), 1);
@@ -435,7 +439,8 @@ mod tests {
                 request(&Method::POST, "/custom/webhook", &empty, reformatted),
                 &state,
                 Some(&signed)
-            ),
+            )
+            .await,
             response(StatusCode::UNAUTHORIZED, "unauthorized\n")
         );
         assert_eq!(
@@ -443,7 +448,8 @@ mod tests {
                 request(&Method::POST, "/custom/webhook", &empty, b"not-json-secret"),
                 &state,
                 None
-            ),
+            )
+            .await,
             response(StatusCode::UNAUTHORIZED, "unauthorized\n")
         );
         assert_eq!(state.dispatcher.events.lock().unwrap().len(), 1);

@@ -3,8 +3,10 @@ use std::io;
 use std::process::ExitCode;
 
 mod config;
+mod discovery;
 mod enrollment;
 mod http;
+mod notion;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
@@ -70,11 +72,23 @@ fn main() -> ExitCode {
                     &enrollment::FileTokenStore::new(paths.state_directory),
                     rotate,
                 ),
-                Command::Serve => http::serve(
-                    &config.runner,
-                    &enrollment::FileTokenStore::new(paths.state_directory),
-                    http::PendingEventDispatcher,
-                ),
+                Command::Serve => {
+                    notion::NotionHttpClient::new(&config.notion, &config.task_properties).and_then(
+                        |notion| {
+                            let dispatcher = discovery::NotionEventDispatcher::new(
+                                notion,
+                                discovery::PendingDiscoverySink,
+                                &config.notion,
+                                &config.task_values,
+                            );
+                            http::serve(
+                                &config.runner,
+                                &enrollment::FileTokenStore::new(paths.state_directory),
+                                dispatcher,
+                            )
+                        },
+                    )
+                }
                 Command::RunOnce => Ok(command_response(command, &config, &paths)),
             })
         }),
