@@ -1,3 +1,18 @@
+## [0.2.0](https://github.com/mtandersson/agent-handover/compare/v0.1.0...v0.2.0) (2026-08-30)
+
+### Features
+
+* **config:** add private runner foundation ([3c34fce](https://github.com/mtandersson/agent-handover/commit/3c34fce82e25abc297b3358dc54537cce4cd5bca))
+
+### Documentation
+
+* publish alpha project contract ([37d030d](https://github.com/mtandersson/agent-handover/commit/37d030d8cee6bbb1d9814b5ab5b1813be8fdd8fc))
+* **skill:** strengthen issue scope gate ([01170b2](https://github.com/mtandersson/agent-handover/commit/01170b288a711ded980f64a83acaed493e16e341))
+
+### Continuous Integration
+
+* configure identity for title validation ([84ec858](https://github.com/mtandersson/agent-handover/commit/84ec858c8130006832910e25f3bb93fb50f736de))
+
 ## [0.1.0](https://github.com/mtandersson/agent-handover/compare/v0.0.0...v0.1.0) (2026-08-30)
 
 ### Features
