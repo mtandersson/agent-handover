@@ -5,7 +5,7 @@ use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -378,11 +378,14 @@ fn validate(config: &Config) -> Result<(), String> {
         }
     }
 
-    let bind_address =
-        config.runner.bind_address.parse::<IpAddr>().map_err(|_| {
-            "configuration field runner.bind_address must be an IP address".to_owned()
+    let bind_address = config
+        .runner
+        .bind_address
+        .parse::<SocketAddr>()
+        .map_err(|_| {
+            "configuration field runner.bind_address must be an IP address and port".to_owned()
         })?;
-    if !bind_address.is_loopback() {
+    if !bind_address.ip().is_loopback() {
         return Err("runner.bind_address must be a loopback address".to_owned());
     }
     validate_endpoint_path("runner.webhook_path", &config.runner.webhook_path)?;
@@ -453,7 +456,7 @@ timeout_seconds = 900
 
 [runner]
 reconciliation_interval_seconds = 60
-bind_address = "127.0.0.1"
+bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#
@@ -618,7 +621,7 @@ health_path = "/health"
     #[test]
     fn rejects_non_loopback_binding() {
         let root = temporary_directory();
-        let contents = fixture().replace("127.0.0.1", "0.0.0.0");
+        let contents = fixture().replace("127.0.0.1:8080", "0.0.0.0:8080");
         let paths = write_fixture(&root, &contents, 0o600);
         assert_eq!(
             load(&paths).unwrap_err(),

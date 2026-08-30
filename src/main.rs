@@ -4,6 +4,7 @@ use std::process::ExitCode;
 
 mod config;
 mod enrollment;
+mod http;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
@@ -69,7 +70,12 @@ fn main() -> ExitCode {
                     &enrollment::FileTokenStore::new(paths.state_directory),
                     rotate,
                 ),
-                _ => Ok(command_response(command, &config, &paths)),
+                Command::Serve => http::serve(
+                    &config.runner,
+                    &enrollment::FileTokenStore::new(paths.state_directory),
+                    http::PendingEventDispatcher,
+                ),
+                Command::RunOnce => Ok(command_response(command, &config, &paths)),
             })
         }),
         Ok(None) if args.iter().any(|arg| arg == "--version" || arg == "-V") => {
@@ -165,7 +171,7 @@ mod tests {
             },
             runner: RunnerConfig {
                 reconciliation_interval_seconds: 60,
-                bind_address: "127.0.0.1".to_owned(),
+                bind_address: "127.0.0.1:8080".to_owned(),
                 webhook_path: "/notion/webhook".to_owned(),
                 health_path: "/health".to_owned(),
             },

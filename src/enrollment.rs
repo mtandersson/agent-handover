@@ -19,6 +19,10 @@ pub trait TokenStore {
     fn persist(&self, token: &str, rotate: bool) -> Result<(), String>;
 }
 
+pub trait TokenSource {
+    fn load(&self) -> Result<String, String>;
+}
+
 pub struct FileTokenStore {
     state_directory: PathBuf,
 }
@@ -51,6 +55,44 @@ impl FileTokenStore {
 impl TokenStore for FileTokenStore {
     fn persist(&self, token: &str, rotate: bool) -> Result<(), String> {
         self.persist_with_operations(token, rotate, &SystemCommitOperations)
+    }
+}
+
+impl TokenSource for FileTokenStore {
+    fn load(&self) -> Result<String, String> {
+        crate::config::ensure_private_directory(&self.state_directory)?;
+        let path = self.state_directory.join(TOKEN_FILE);
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "no Notion webhook verification token is enrolled; run webhook-enroll first"
+                        .to_owned()
+                } else {
+                    format!("cannot safely open webhook token file: {error}")
+                }
+            })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot inspect webhook token file: {error}"))?;
+        if !metadata.is_file() {
+            return Err("webhook token path is not a regular file".to_owned());
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode != 0o600 {
+            return Err(format!(
+                "webhook token file must have mode 0600, not {mode:04o}"
+            ));
+        }
+        let mut token = String::new();
+        file.read_to_string(&mut token)
+            .map_err(|error| format!("cannot read webhook token file: {error}"))?;
+        if token.is_empty() {
+            return Err("webhook token file is empty; rotate the enrolled token".to_owned());
+        }
+        Ok(token)
     }
 }
 
@@ -401,6 +443,41 @@ mod tests {
         let token_file = state.join(TOKEN_FILE);
         assert_eq!(fs::read_to_string(&token_file).unwrap(), "second");
         assert_eq!(fs::metadata(token_file).unwrap().mode() & 0o777, 0o600);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_an_enrolled_private_token_without_exposing_it() {
+        let root = temporary_directory();
+        let state = root.join("state/agent-handover");
+        let store = FileTokenStore::new(state);
+        store.persist("enrolled-secret", false).unwrap();
+
+        assert_eq!(store.load().unwrap(), "enrolled-secret");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loading_refuses_unsafe_or_missing_token_files_with_secret_safe_errors() {
+        let root = temporary_directory();
+        let state = root.join("state/agent-handover");
+        let store = FileTokenStore::new(state.clone());
+        assert!(store.load().unwrap_err().contains("webhook-enroll"));
+
+        let token_file = state.join(TOKEN_FILE);
+        fs::write(&token_file, "actual-secret").unwrap();
+        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let error = store.load().unwrap_err();
+        assert!(error.contains("mode 0600"));
+        assert!(!error.contains("actual-secret"));
+
+        fs::remove_file(&token_file).unwrap();
+        let target = root.join("target");
+        fs::write(&target, "target-secret").unwrap();
+        symlink(&target, &token_file).unwrap();
+        let error = store.load().unwrap_err();
+        assert!(error.contains("cannot safely open"));
+        assert!(!error.contains("target-secret"));
         fs::remove_dir_all(root).unwrap();
     }
 

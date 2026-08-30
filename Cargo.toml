@@ -7,7 +7,14 @@ description = "Notion-driven local Codex task runner"
 publish = false
 
 [dependencies]
+axum = "0.8"
+hmac = "0.12"
+http-body-util = "0.1"
+hyper = { version = "1.0", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["service", "tokio"] }
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+tokio = { version = "1.0", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 toml = "0.9"
