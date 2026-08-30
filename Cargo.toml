@@ -7,3 +7,6 @@ description = "Notion-driven local Codex task runner"
 publish = false
 
 [dependencies]
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.9"
