@@ -1,3 +1,9 @@
+## [0.3.0](https://github.com/mtandersson/agent-handover/compare/v0.2.0...v0.3.0) (2026-08-30)
+
+### Features
+
+* **webhook:** enroll verification tokens ([7459da4](https://github.com/mtandersson/agent-handover/commit/7459da406e876405407458cc65a1f57ed0c311d1))
+
 ## [0.2.0](https://github.com/mtandersson/agent-handover/compare/v0.1.0...v0.2.0) (2026-08-30)
 
 ### Features
