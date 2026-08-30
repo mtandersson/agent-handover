@@ -18,6 +18,7 @@ The project is currently a minimal Rust CLI:
 - `src/main.rs`: current command entry point and its unit tests.
 - `src/config.rs`: private XDG host configuration and path contracts.
 - `src/enrollment.rs`: fakeable webhook-token enrollment and private file storage.
+- `src/http.rs`: loopback HTTP serving, webhook authentication, and fake dispatch boundary.
 - `flake.nix` and `Cargo.toml`: reproducible toolchain, checks, and package
   metadata.
 - `.github/workflows`: pull-request validation and automated releases.

@@ -6,9 +6,10 @@ a shared task queue and audit journal while keeping execution policy, secrets,
 and durable launch state on one private host.
 
 The repository contains the Rust CLI, private host configuration foundation,
-webhook-token enrollment, and build and release tooling. Runner commands
-validate and expose their execution configuration, but do not contact Notion or
-launch Codex yet. Follow the [roadmap](#roadmap) for the remaining
+webhook-token enrollment, authenticated webhook HTTP intake, and build and
+release tooling. `serve` exposes the configured health and webhook routes;
+authenticated events currently stop at a dispatch boundary and do not contact
+Notion or launch Codex yet. Follow the [roadmap](#roadmap) for the remaining
 implementation sequence.
 
 ## Intended capabilities
@@ -54,9 +55,9 @@ nix develop --command cargo test
 
 The operator flow is to configure and share the Notion data sources, enroll a
 connection webhook, expose only that route through Cloudflare Tunnel, and start
-`agent-handover serve`. At present the runner commands validate configuration
-and report that it is ready; integrations will become active as later roadmap
-tickets land.
+`agent-handover serve`. The server answers health checks and authenticates
+webhook JSON; Notion reconciliation and execution become active as later
+roadmap tickets land.
 
 ## Notion setup
 
@@ -96,6 +97,13 @@ from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
 signals: they can be delayed, duplicated, or delivered out of order, as
 described by [Notion's event-delivery contract][notion-delivery], so the runner
 refetches the page and reconciliation remains authoritative for discovery.
+
+Webhook request bodies are limited to 1 MiB and must arrive within five
+seconds. Oversized requests receive `413 Payload Too Large`; slow request bodies
+receive `408 Request Timeout` without blocking health checks or other requests.
+The server admits at most 16 active connections. Excess connections are closed,
+each admitted connection has a ten-second whole-lifecycle deadline, and shutdown
+closes outstanding connections so partial requests cannot delay termination.
 
 Notion requires a public HTTPS webhook URL. A [locally managed Cloudflare
 Tunnel][cloudflare-tunnel] can route only the webhook path to the loopback-bound
@@ -157,14 +165,15 @@ timeout_seconds = 900
 
 [runner]
 reconciliation_interval_seconds = 60
-bind_address = "127.0.0.1"
+bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 ```
 
 Supported sandbox values are `read-only`, `workspace-write`, and
 `danger-full-access`; the runner passes the configured policy through without
-weakening it. Binding is restricted to an IPv4 or IPv6 loopback address.
+weakening it. The bind address must include a port and use an IPv4 or IPv6
+loopback address.
 Property names and lifecycle values must be non-empty and distinct, the Codex
 working directory must be absolute, durations must be positive, and the
 environment list accepts variable names only—not values.
@@ -194,7 +203,7 @@ The runner interface is:
 
 | Command | Target behavior |
 | --- | --- |
-| `agent-handover serve` | Validate and expose configuration; later receive webhooks, reconcile, and drain tasks sequentially |
+| `agent-handover serve` | Serve the configured health route and authenticate Notion webhook JSON before dispatch; later reconcile and drain tasks sequentially |
 | `agent-handover run-once` | Validate and expose configuration; later reconcile and drain eligible tasks once |
 | `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
 | `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
