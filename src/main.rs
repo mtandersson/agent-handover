@@ -1,20 +1,71 @@
 use std::env;
 use std::process::ExitCode;
 
-fn response(args: &[String]) -> Result<String, String> {
+mod config;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    Serve,
+    RunOnce,
+    WebhookEnroll,
+}
+
+fn parse_command(args: &[String]) -> Result<Option<Command>, String> {
     match args {
-        [] => Ok("agent-handover is ready".to_owned()),
-        [flag] if flag == "--version" || flag == "-V" => {
-            Ok(format!("agent-handover {}", env!("CARGO_PKG_VERSION")))
-        }
-        _ => Err("usage: agent-handover [--version]".to_owned()),
+        [] => Ok(None),
+        [command] if command == "serve" => Ok(Some(Command::Serve)),
+        [command] if command == "run-once" => Ok(Some(Command::RunOnce)),
+        [command] if command == "webhook-enroll" => Ok(Some(Command::WebhookEnroll)),
+        [flag] if flag == "--version" || flag == "-V" => Ok(None),
+        _ => Err(usage()),
     }
+}
+
+fn usage() -> String {
+    "usage: agent-handover [--version | serve | run-once | webhook-enroll]".to_owned()
+}
+
+fn command_response(
+    command: Command,
+    config: &config::Config,
+    paths: &config::HostPaths,
+) -> String {
+    let name = match command {
+        Command::Serve => "serve",
+        Command::RunOnce => "run-once",
+        Command::WebhookEnroll => "webhook-enroll",
+    };
+    format!(
+        "{name} configuration ready: state={}, codex={}, workdir={}, profile={}, sandbox={}, environment={}, timeout={}s, reconcile={}s, bind={}, webhook={}, health={}",
+        paths.state_directory.display(),
+        config.codex.executable.display(),
+        config.codex.working_directory.display(),
+        config.codex.profile,
+        config.codex.sandbox,
+        config.codex.permitted_environment.join(","),
+        config.codex.timeout_seconds,
+        config.runner.reconciliation_interval_seconds,
+        config.runner.bind_address,
+        config.runner.webhook_path,
+        config.runner.health_path,
+    )
 }
 
 fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
 
-    match response(&args) {
+    let result = match parse_command(&args) {
+        Ok(Some(command)) => config::HostPaths::discover().and_then(|paths| {
+            config::load(&paths).map(|config| command_response(command, &config, &paths))
+        }),
+        Ok(None) if args.iter().any(|arg| arg == "--version" || arg == "-V") => {
+            Ok(format!("agent-handover {}", env!("CARGO_PKG_VERSION")))
+        }
+        Ok(None) => Ok("agent-handover is ready".to_owned()),
+        Err(error) => Err(error),
+    };
+
+    match result {
         Ok(message) => {
             println!("{message}");
             ExitCode::SUCCESS
@@ -28,26 +79,90 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::response;
+    use super::{Command, command_response, parse_command, usage};
+    use crate::config::{
+        CodexConfig, Config, HostPaths, NotionConfig, RunnerConfig, SandboxPolicy, TaskProperties,
+        TaskValues,
+    };
+    use std::path::PathBuf;
 
     #[test]
     fn reports_that_the_command_is_ready_without_arguments() {
-        assert_eq!(response(&[]), Ok("agent-handover is ready".to_owned()));
+        assert_eq!(parse_command(&[]), Ok(None));
     }
 
     #[test]
     fn reports_the_package_version() {
+        assert_eq!(parse_command(&["--version".to_owned()]), Ok(None));
+    }
+
+    #[test]
+    fn parses_each_runner_command() {
         assert_eq!(
-            response(&["--version".to_owned()]),
-            Ok(format!("agent-handover {}", env!("CARGO_PKG_VERSION")))
+            parse_command(&["serve".to_owned()]),
+            Ok(Some(Command::Serve))
+        );
+        assert_eq!(
+            parse_command(&["run-once".to_owned()]),
+            Ok(Some(Command::RunOnce))
+        );
+        assert_eq!(
+            parse_command(&["webhook-enroll".to_owned()]),
+            Ok(Some(Command::WebhookEnroll))
         );
     }
 
     #[test]
     fn rejects_unsupported_arguments_with_the_usage() {
-        assert_eq!(
-            response(&["unexpected".to_owned()]),
-            Err("usage: agent-handover [--version]".to_owned())
-        );
+        assert_eq!(parse_command(&["unexpected".to_owned()]), Err(usage()));
+    }
+
+    #[test]
+    fn command_summary_exposes_operational_configuration_but_not_secrets() {
+        let config = Config {
+            notion: NotionConfig {
+                token: "secret-placeholder".to_owned(),
+                task_data_source_id: "task-placeholder".to_owned(),
+                journal_data_source_id: "journal-placeholder".to_owned(),
+            },
+            task_properties: TaskProperties {
+                title: "Name".to_owned(),
+                executor: "Executor".to_owned(),
+                status: "Status".to_owned(),
+            },
+            task_values: TaskValues {
+                codex: "Codex".to_owned(),
+                pending: "Pending".to_owned(),
+                running: "Running".to_owned(),
+                error: "Error".to_owned(),
+                done: "Done".to_owned(),
+            },
+            codex: CodexConfig {
+                executable: PathBuf::from("codex"),
+                working_directory: PathBuf::from("/srv/project-placeholder"),
+                profile: "runner-placeholder".to_owned(),
+                sandbox: SandboxPolicy::WorkspaceWrite,
+                permitted_environment: vec!["PATH".to_owned()],
+                timeout_seconds: 900,
+            },
+            runner: RunnerConfig {
+                reconciliation_interval_seconds: 60,
+                bind_address: "127.0.0.1".to_owned(),
+                webhook_path: "/notion/webhook".to_owned(),
+                health_path: "/health".to_owned(),
+            },
+        };
+        let paths = HostPaths {
+            config_file: PathBuf::from("/config-placeholder/config.toml"),
+            state_directory: PathBuf::from("/state-placeholder"),
+        };
+
+        for command in [Command::Serve, Command::RunOnce, Command::WebhookEnroll] {
+            let summary = command_response(command, &config, &paths);
+            assert!(summary.contains("configuration ready"));
+            assert!(summary.contains("sandbox=workspace-write"));
+            assert!(!summary.contains("secret-placeholder"));
+            assert!(!summary.contains("task-placeholder"));
+        }
     }
 }

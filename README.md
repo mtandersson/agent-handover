@@ -5,10 +5,10 @@ Notion tasks through Codex CLI. It is intended for a trusted operator who wants
 a shared task queue and audit journal while keeping execution policy, secrets,
 and durable launch state on one private host.
 
-The repository currently contains a minimal Rust CLI and the build and release
-foundation. The runner commands and integrations described below are the target
-contract and are not implemented yet. Follow the [roadmap](#roadmap) for the
-implementation sequence.
+The repository contains the Rust CLI, private host configuration foundation,
+and build and release tooling. The commands validate and expose their execution
+configuration, but do not contact Notion or launch Codex yet. Follow the
+[roadmap](#roadmap) for the remaining implementation sequence.
 
 ## Intended capabilities
 
@@ -44,18 +44,18 @@ project.
 
 ## Quick start
 
-The runnable project is still the minimal CLI. Build and exercise that baseline
-from the locked development environment:
+Build and exercise the CLI from the locked development environment:
 
 ```sh
 nix develop --command cargo run
 nix develop --command cargo test
 ```
 
-The target operator flow is to configure and share the Notion data sources,
-enroll a connection webhook, expose only that route through Cloudflare Tunnel,
-and start `agent-handover serve`. Those runner commands will become usable as
-their roadmap tickets land; the sections below define their contract now.
+The operator flow is to configure and share the Notion data sources, enroll a
+connection webhook, expose only that route through Cloudflare Tunnel, and start
+`agent-handover serve`. At present the runner commands validate configuration
+and report that it is ready; integrations will become active as later roadmap
+tickets land.
 
 ## Notion setup
 
@@ -117,24 +117,64 @@ connection's webhook subscription.
 
 ## Private host configuration
 
-The target design uses one host-wide execution profile and XDG configuration
-and state directories. The concrete file format will be introduced with the
-configuration ticket; it will cover:
+The CLI reads one host-wide TOML profile from
+`$XDG_CONFIG_HOME/agent-handover/config.toml`, falling back to
+`$HOME/.config/agent-handover/config.toml`. Durable state belongs under
+`$XDG_STATE_HOME/agent-handover`, falling back to
+`$HOME/.local/state/agent-handover`.
 
-- Notion credentials, data source IDs, and property mappings;
-- Codex executable, profile, working directory, and sandbox policy;
-- the explicit environment allowlist, execution timeout, and reconciliation
-  interval;
-- bind address plus webhook and health endpoint paths.
+The application directories are created or corrected to mode `0700`. The
+configuration file must already exist with mode `0600`; the runner refuses to
+read a more permissive file. Create a private file containing placeholder-free
+host values in this form:
 
-Private directories must use mode `0700` and sensitive files mode `0600`.
+```toml
+[notion]
+token = "<NOTION_TOKEN>"
+task_data_source_id = "<TASK_DATA_SOURCE_ID>"
+journal_data_source_id = "<JOURNAL_DATA_SOURCE_ID>"
+
+[task_properties]
+title = "Name"
+executor = "Executor"
+status = "Status"
+
+[task_values]
+codex = "Codex"
+pending = "Pending"
+running = "Running"
+error = "Error"
+done = "Done"
+
+[codex]
+executable = "codex"
+working_directory = "/absolute/path/to/project"
+profile = "runner"
+sandbox = "workspace-write"
+permitted_environment = ["PATH"]
+timeout_seconds = 900
+
+[runner]
+reconciliation_interval_seconds = 60
+bind_address = "127.0.0.1"
+webhook_path = "/notion/webhook"
+health_path = "/health"
+```
+
+Supported sandbox values are `read-only`, `workspace-write`, and
+`danger-full-access`; the runner passes the configured policy through without
+weakening it. Binding is restricted to an IPv4 or IPv6 loopback address.
+Property names and lifecycle values must be non-empty and distinct, the Codex
+working directory must be absolute, durations must be positive, and the
+environment list accepts variable names only—not values.
+
 Operational state, verification tokens, prompts, agent output, run records, and
-host-specific paths must never be committed. Normal logs must not include full
-task prompts or captured agent output.
+host-specific paths must never be committed. Configuration diagnostics and
+normal logs omit the Notion token and data source IDs.
 
 ## Commands
 
-Today, the minimal CLI supports:
+The CLI supports:
 
 ```console
 $ agent-handover
@@ -144,13 +184,13 @@ $ agent-handover --version
 agent-handover 0.1.0
 ```
 
-The planned runner interface is:
+The runner interface is:
 
 | Command | Target behavior |
 | --- | --- |
-| `agent-handover serve` | Receive webhooks, reconcile at startup and periodically, and drain eligible tasks sequentially |
-| `agent-handover run-once` | Reconcile and drain eligible tasks once for cron or diagnostics |
-| `agent-handover webhook-enroll` | Capture or explicitly rotate the one-time webhook verification token |
+| `agent-handover serve` | Validate and expose configuration; later receive webhooks, reconcile, and drain tasks sequentially |
+| `agent-handover run-once` | Validate and expose configuration; later reconcile and drain eligible tasks once |
+| `agent-handover webhook-enroll` | Validate and expose configuration; later capture or rotate the verification token |
 
 Unsupported or incomplete configuration will fail with actionable errors that
 do not reveal secrets.
