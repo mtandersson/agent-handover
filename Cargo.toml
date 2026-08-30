@@ -1,0 +1,9 @@
+[package]
+name = "agent-handover"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Minimal agent handover command-line project"
+publish = false
+
+[dependencies]

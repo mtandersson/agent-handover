@@ -1,0 +1,4 @@
+interface:
+  display_name: "Issue to Merge"
+  short_description: "Run scoped GitHub issue iterations safely"
+  default_prompt: "Use $issue-to-merge to process one GitHub issue iteration."
