@@ -1,3 +1,9 @@
+## [0.5.0](https://github.com/mtandersson/agent-handover/compare/v0.4.0...v0.5.0) (2026-08-30)
+
+### Features
+
+* **notion:** filter webhook task signals ([1d0a258](https://github.com/mtandersson/agent-handover/commit/1d0a2584faf0761e023f7387d6670b68ac54c575))
+
 ## [0.4.0](https://github.com/mtandersson/agent-handover/compare/v0.3.0...v0.4.0) (2026-08-30)
 
 ### Features
