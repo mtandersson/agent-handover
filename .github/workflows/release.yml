@@ -30,7 +30,9 @@ jobs:
         uses: cachix/install-nix-action@v31
 
       - name: Validate commits since the latest release
-        run: nix develop --command cog check --from-latest-tag
+        run: |
+          latest_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*')
+          nix develop --command cog check "$latest_tag..HEAD"
 
       - name: Run all checks
         run: nix flake check --print-build-logs
