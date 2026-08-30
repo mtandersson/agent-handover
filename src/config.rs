@@ -202,7 +202,7 @@ fn ensure_private_parent(file: &Path) -> Result<(), String> {
     ensure_private_directory(parent)
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), String> {
+pub(crate) fn ensure_private_directory(path: &Path) -> Result<(), String> {
     if !path.exists() {
         fs::DirBuilder::new()
             .recursive(true)

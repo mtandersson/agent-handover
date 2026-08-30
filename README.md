@@ -6,9 +6,10 @@ a shared task queue and audit journal while keeping execution policy, secrets,
 and durable launch state on one private host.
 
 The repository contains the Rust CLI, private host configuration foundation,
-and build and release tooling. The commands validate and expose their execution
-configuration, but do not contact Notion or launch Codex yet. Follow the
-[roadmap](#roadmap) for the remaining implementation sequence.
+webhook-token enrollment, and build and release tooling. Runner commands
+validate and expose their execution configuration, but do not contact Notion or
+launch Codex yet. Follow the [roadmap](#roadmap) for the remaining
+implementation sequence.
 
 ## Intended capabilities
 
@@ -89,8 +90,8 @@ not put them in this repository.
 
 ### Connection webhook
 
-The planned `webhook-enroll` command captures Notion's one-time verification
-token with overwrite protection. Subsequent webhook requests are authenticated
+The `webhook-enroll` command captures Notion's one-time verification token with
+overwrite protection. Subsequent webhook requests will be authenticated
 from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
 signals: they can be delayed, duplicated, or delivered out of order, as
 described by [Notion's event-delivery contract][notion-delivery], so the runner
@@ -172,6 +173,11 @@ Operational state, verification tokens, prompts, agent output, run records, and
 host-specific paths must never be committed. Configuration diagnostics and
 normal logs omit the Notion token and data source IDs.
 
+The webhook verification token is stored at
+`$XDG_STATE_HOME/agent-handover/notion-webhook-verification-token`, falling back
+to `$HOME/.local/state/agent-handover`. The file is created atomically with mode
+`0600`; symbolic links and unsafe existing files are refused.
+
 ## Commands
 
 The CLI supports:
@@ -190,10 +196,27 @@ The runner interface is:
 | --- | --- |
 | `agent-handover serve` | Validate and expose configuration; later receive webhooks, reconcile, and drain tasks sequentially |
 | `agent-handover run-once` | Validate and expose configuration; later reconcile and drain eligible tasks once |
-| `agent-handover webhook-enroll` | Validate and expose configuration; later capture or rotate the verification token |
+| `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
+| `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
 
 Unsupported or incomplete configuration will fail with actionable errors that
 do not reveal secrets.
+
+Enrollment is non-interactive and accepts the JSON payload on standard input,
+keeping the token out of command arguments and normal output:
+
+```sh
+printf '%s\n' '{"verification_token":"<VERIFICATION_TOKEN>"}' \
+  | agent-handover webhook-enroll
+```
+
+Repeat enrollment is refused. Use `--rotate` only when deliberately replacing
+the enrolled token:
+
+```sh
+printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
+  | agent-handover webhook-enroll --rotate
+```
 
 ## Task lifecycle and safety
 
