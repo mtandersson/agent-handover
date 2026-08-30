@@ -1,13 +1,15 @@
 use std::env;
+use std::io;
 use std::process::ExitCode;
 
 mod config;
+mod enrollment;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
     Serve,
     RunOnce,
-    WebhookEnroll,
+    WebhookEnroll { rotate: bool },
 }
 
 fn parse_command(args: &[String]) -> Result<Option<Command>, String> {
@@ -15,14 +17,19 @@ fn parse_command(args: &[String]) -> Result<Option<Command>, String> {
         [] => Ok(None),
         [command] if command == "serve" => Ok(Some(Command::Serve)),
         [command] if command == "run-once" => Ok(Some(Command::RunOnce)),
-        [command] if command == "webhook-enroll" => Ok(Some(Command::WebhookEnroll)),
+        [command] if command == "webhook-enroll" => {
+            Ok(Some(Command::WebhookEnroll { rotate: false }))
+        }
+        [command, flag] if command == "webhook-enroll" && flag == "--rotate" => {
+            Ok(Some(Command::WebhookEnroll { rotate: true }))
+        }
         [flag] if flag == "--version" || flag == "-V" => Ok(None),
         _ => Err(usage()),
     }
 }
 
 fn usage() -> String {
-    "usage: agent-handover [--version | serve | run-once | webhook-enroll]".to_owned()
+    "usage: agent-handover [--version | serve | run-once | webhook-enroll [--rotate]]".to_owned()
 }
 
 fn command_response(
@@ -33,7 +40,7 @@ fn command_response(
     let name = match command {
         Command::Serve => "serve",
         Command::RunOnce => "run-once",
-        Command::WebhookEnroll => "webhook-enroll",
+        Command::WebhookEnroll { .. } => "webhook-enroll",
     };
     format!(
         "{name} configuration ready: state={}, codex={}, workdir={}, profile={}, sandbox={}, environment={}, timeout={}s, reconcile={}s, bind={}, webhook={}, health={}",
@@ -56,7 +63,14 @@ fn main() -> ExitCode {
 
     let result = match parse_command(&args) {
         Ok(Some(command)) => config::HostPaths::discover().and_then(|paths| {
-            config::load(&paths).map(|config| command_response(command, &config, &paths))
+            config::load(&paths).and_then(|config| match command {
+                Command::WebhookEnroll { rotate } => enrollment::enroll(
+                    io::stdin().lock(),
+                    &enrollment::FileTokenStore::new(paths.state_directory),
+                    rotate,
+                ),
+                _ => Ok(command_response(command, &config, &paths)),
+            })
         }),
         Ok(None) if args.iter().any(|arg| arg == "--version" || arg == "-V") => {
             Ok(format!("agent-handover {}", env!("CARGO_PKG_VERSION")))
@@ -108,7 +122,11 @@ mod tests {
         );
         assert_eq!(
             parse_command(&["webhook-enroll".to_owned()]),
-            Ok(Some(Command::WebhookEnroll))
+            Ok(Some(Command::WebhookEnroll { rotate: false }))
+        );
+        assert_eq!(
+            parse_command(&["webhook-enroll".to_owned(), "--rotate".to_owned()]),
+            Ok(Some(Command::WebhookEnroll { rotate: true }))
         );
     }
 
@@ -157,7 +175,7 @@ mod tests {
             state_directory: PathBuf::from("/state-placeholder"),
         };
 
-        for command in [Command::Serve, Command::RunOnce, Command::WebhookEnroll] {
+        for command in [Command::Serve, Command::RunOnce] {
             let summary = command_response(command, &config, &paths);
             assert!(summary.contains("configuration ready"));
             assert!(summary.contains("sandbox=workspace-write"));
