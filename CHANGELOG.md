@@ -1,3 +1,9 @@
+## [0.4.0](https://github.com/mtandersson/agent-handover/compare/v0.3.0...v0.4.0) (2026-08-30)
+
+### Features
+
+* **webhook:** authenticate HTTP intake ([1429f83](https://github.com/mtandersson/agent-handover/commit/1429f837f1c82734f40c54c5b5d8de400b86fd82))
+
 ## [0.3.0](https://github.com/mtandersson/agent-handover/compare/v0.2.0...v0.3.0) (2026-08-30)
 
 ### Features
