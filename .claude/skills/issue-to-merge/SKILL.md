@@ -1,6 +1,6 @@
 ---
 name: issue-to-merge
-description: Run one disciplined GitHub issue iteration from leaf selection through a focused implementation, independent review, verified pull request, and merge.
+description: 'Process one GitHub issue—including requests such as "implement #123"—by enforcing a scope gate, splitting broad work into smaller preferably vertical child issues, or taking one suitable leaf through implementation, independent review, a verified pull request, and merge.'
 ---
 
 # Issue to merge
@@ -9,10 +9,25 @@ Run exactly one iteration unless the user explicitly asks to continue.
 
 ## Select and decide
 
-Choose an open issue with no sub-issues and verify its hierarchy, current-main
-behavior, and overlap with open pull requests. Implement it only when the
-solution is self-contained and modest. If it is too broad, create independently
-shippable child issues, link them to the parent, verify the hierarchy, and stop.
+Use an issue identified by the user; otherwise choose an open issue with no
+sub-issues. Verify its hierarchy, current-main behavior, and overlap with open
+pull requests before implementation.
+
+Apply the scope gate even when the user explicitly says to implement a specific
+issue. Naming an issue selects it for this workflow; it does not require the
+whole issue to be implemented in one pull request and does not bypass
+decomposition. Implement only when the selected issue is self-contained and
+modest, with a focused verification boundary.
+
+If the selected issue is broader than that, do not begin implementation or
+open a pull request for the parent. Split it into smaller coherent child issues,
+link them to the parent, verify the hierarchy, and stop after reporting the
+split. A child does not need to be immediately implementable; a later iteration
+may apply the same scope gate and split it again. Prefer vertical slices that
+express a use case or observable behavior a human can test. Avoid horizontal
+splits by technical layer when a meaningful vertical boundary is available.
+Do not continue by implementing a child issue in the same iteration unless the
+user explicitly asks to continue.
 
 Read the repository map and relevant source before implementation. Treat source,
 tests, workflows, manifests, and current GitHub state as authoritative.
