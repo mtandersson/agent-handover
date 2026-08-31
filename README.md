@@ -30,6 +30,10 @@ executor boundary and shared journal remain provider-neutral, but a Claude
 adapter, multiple host profiles, concurrent execution, and automatic agent
 retries are out of scope.
 
+Private local state now provides the process-lock and prepared-attempt
+foundation for later orchestration. It is not wired into `serve` or `run-once`
+until reconciliation and sequential draining are implemented.
+
 ## Architecture
 
 ```mermaid
@@ -295,6 +299,13 @@ An eligible task follows this target lifecycle:
 One process lock protects each stable local state directory, and one task runs
 at a time. Local run records are the authority for automatic launch decisions;
 Notion status is an observable projection, not a distributed lock.
+
+Each local prepared record is durably published with mode `0600` before later
+orchestration performs remote writes. It contains only an immutable random run
+ID, an opaque task key, and the prepared state; task instructions, executor
+output, secrets, and host paths are excluded. The non-blocking process lock
+rejects a second owner for the same state directory and is released when its
+owner exits.
 
 ### Recovery and retries
 
