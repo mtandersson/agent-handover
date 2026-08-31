@@ -17,13 +17,19 @@ const MAX_EVENT_FIELD_BYTES: usize = 128;
 const MAX_TIMESTAMP_BYTES: usize = 64;
 
 pub trait DiscoverySink: Send + Sync + 'static {
-    fn task_discovered(&self, task: TaskState) -> Result<(), String>;
+    fn task_discovered(&self, task: DiscoveredTask) -> Result<(), String>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredTask {
+    pub state: TaskState,
+    pub instructions: String,
 }
 
 pub struct PendingDiscoverySink;
 
 impl DiscoverySink for PendingDiscoverySink {
-    fn task_discovered(&self, _task: TaskState) -> Result<(), String> {
+    fn task_discovered(&self, _task: DiscoveredTask) -> Result<(), String> {
         Ok(())
     }
 }
@@ -302,8 +308,12 @@ where
             }
         }
 
+        let instructions = self.adapter.render_task(&task.page_id).await?;
         let sink = Arc::clone(&self.sink);
-        let sink_task = task.clone();
+        let sink_task = DiscoveredTask {
+            state: task.clone(),
+            instructions,
+        };
         let result = tokio::task::spawn_blocking(move || sink.task_discovered(sink_task))
             .await
             .map_err(|_| "discovery boundary stopped unexpectedly".to_owned())?;
@@ -488,13 +498,20 @@ mod tests {
                 task
             })
         }
+
+        fn render_task<'a>(
+            &'a self,
+            page_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async move { Ok(format!("instructions for {page_id}")) })
+        }
     }
 
     #[derive(Default)]
-    struct RecordingSink(StdMutex<Vec<TaskState>>);
+    struct RecordingSink(StdMutex<Vec<DiscoveredTask>>);
 
     impl DiscoverySink for RecordingSink {
-        fn task_discovered(&self, task: TaskState) -> EventResult {
+        fn task_discovered(&self, task: DiscoveredTask) -> EventResult {
             self.0.lock().unwrap().push(task);
             Ok(())
         }
@@ -596,7 +613,9 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 3);
-        assert_eq!(dispatcher.inner.sink.0.lock().unwrap().len(), 1);
+        let discovered = dispatcher.inner.sink.0.lock().unwrap();
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].instructions, "instructions for p");
     }
 
     #[tokio::test]
@@ -617,7 +636,7 @@ mod tests {
         }
         let revisions = dispatcher.inner.sink.0.lock().unwrap();
         assert_eq!(revisions.len(), 2);
-        assert!(revisions[0].revision.instant() < revisions[1].revision.instant());
+        assert!(revisions[0].state.revision.instant() < revisions[1].state.revision.instant());
     }
 
     #[tokio::test]
@@ -644,7 +663,7 @@ mod tests {
         let revisions = dispatcher.inner.sink.0.lock().unwrap();
         assert_eq!(revisions.len(), 1);
         assert_eq!(
-            revisions[0].revision.instant(),
+            revisions[0].state.revision.instant(),
             TaskRevision::parse("2026-01-02T00:00:00Z")
                 .unwrap()
                 .instant()
@@ -658,7 +677,7 @@ mod tests {
     }
 
     impl DiscoverySink for BlockingSink {
-        fn task_discovered(&self, _task: TaskState) -> EventResult {
+        fn task_discovered(&self, _task: DiscoveredTask) -> EventResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.started.add_permits(1);
             let (released, changed) = &self.released;
