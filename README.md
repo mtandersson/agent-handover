@@ -382,11 +382,13 @@ project does not publish or validate additional operating-system targets.
 
 ## Releases
 
-Qualifying Conventional Commits merged to `main` publish releases
-automatically. `feat` creates a minor release; `fix`, `perf`, `refactor`, and
+The release workflow is scheduled for every Monday at 15:00 UTC and can also
+be started on demand with GitHub Actions' **Run workflow** control.
+Qualifying Conventional Commits since the latest release determine the next
+version: `feat` creates a minor release; `fix`, `perf`, `refactor`, and
 `revert` create a patch release; and breaking changes create a major release.
-Generated changelog entries, release tags, and version metadata are maintained
-by the release workflow.
+Generated changelog entries,
+release tags, and version metadata are maintained by the release workflow.
 
 ## Roadmap
 
