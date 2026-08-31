@@ -364,6 +364,11 @@ The main verification command matches CI:
 nix flake check
 ```
 
+GitHub Actions runs these checks on Linux x86-64. CI evaluates the complete
+flake, then runs the GNU and quality checks alongside the musl build on
+separate runners. Crane build artifacts let the GNU package, Clippy, and tests
+reuse the same compiled Rust dependencies within their job.
+
 Build either Linux x86-64 release target with:
 
 ```sh
@@ -372,7 +377,8 @@ nix build .#musl
 ```
 
 `gnu` produces a glibc-linked binary. `musl` produces a statically linked
-binary.
+binary. Both supported release variants are built by `nix flake check`; the
+project does not publish or validate additional operating-system targets.
 
 ## Releases
 

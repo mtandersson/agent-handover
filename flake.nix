@@ -1,42 +1,50 @@
 {
   description = "Reproducible development and release builds for agent-handover";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane/v0.24.0";
+  };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, crane }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       version = pkgs.lib.removeSuffix "\n" (builtins.readFile ./VERSION);
-      source = pkgs.lib.cleanSourceWith {
-        src = ./.;
-        filter = path: type:
-          let
-            name = baseNameOf path;
-          in
-          !(
-            name == ".git"
-            || name == ".direnv"
-            || name == "target"
-            || name == "dist"
-            || name == "result"
-            || pkgs.lib.hasPrefix "result-" name
-          );
-      };
-      packageArgs = {
+      craneLib = crane.mkLib pkgs;
+      cargoSource = craneLib.cleanCargoSource ./.;
+      commonArgs = {
         pname = "agent-handover";
-        inherit version source;
-        src = source;
-        cargoLock.lockFile = ./Cargo.lock;
+        inherit version;
+        src = cargoSource;
+        strictDeps = true;
       };
-      gnu = (pkgs.rustPlatform.buildRustPackage packageArgs).overrideAttrs (old: {
-        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.patchelf ];
-        postFixup = (old.postFixup or "") + ''
+      cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+        cargoExtraArgs = "--all-features";
+      });
+      gnu = craneLib.buildPackage (commonArgs // {
+        inherit cargoArtifacts;
+        doCheck = false;
+        nativeBuildInputs = [ pkgs.patchelf ];
+        postFixup = ''
           patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 \
             --remove-rpath "$out/bin/agent-handover"
         '';
       });
-      musl = pkgs.pkgsStatic.rustPlatform.buildRustPackage packageArgs;
+      staticCraneLib = crane.mkLib pkgs.pkgsStatic;
+      staticArgs = {
+        pname = "agent-handover";
+        inherit version;
+        src = staticCraneLib.cleanCargoSource ./.;
+        strictDeps = true;
+      };
+      staticCargoArtifacts = staticCraneLib.buildDepsOnly (staticArgs // {
+        cargoExtraArgs = "--all-features";
+      });
+      musl = staticCraneLib.buildPackage (staticArgs // {
+        cargoArtifacts = staticCargoArtifacts;
+        doCheck = false;
+      });
       releaseTooling = pkgs.buildNpmPackage {
         pname = "agent-handover-release-tooling";
         version = "25.0.9";
@@ -53,14 +61,20 @@
             --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git pkgs.nodejs_24 ]}
         '';
       };
-      quality = gnu.overrideAttrs (old: {
-        pname = "agent-handover-quality";
-        nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.clippy pkgs.rustfmt ];
-        preBuild = ''
-          cargo fmt --check
-          cargo clippy --all-targets --all-features -- -D warnings
-        '';
+      format = craneLib.cargoFmt { src = cargoSource; };
+      clippy = craneLib.cargoClippy (commonArgs // {
+        inherit cargoArtifacts;
+        cargoClippyExtraArgs = "--all-targets --all-features -- -D warnings";
       });
+      tests = craneLib.cargoTest (commonArgs // {
+        inherit cargoArtifacts;
+        cargoTestExtraArgs = "--all-targets --all-features";
+      });
+      quality = pkgs.linkFarm "agent-handover-quality" [
+        { name = "format"; path = format; }
+        { name = "clippy"; path = clippy; }
+        { name = "tests"; path = tests; }
+      ];
       scripts = pkgs.runCommand "agent-handover-script-checks" {
         nativeBuildInputs = [ pkgs.actionlint pkgs.shellcheck ];
       } ''
