@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Rust and Nix checks
+  gnu-and-quality:
+    name: GNU and quality checks
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -41,5 +41,27 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: nix develop --command cog check "$BASE_SHA..$HEAD_SHA"
 
-      - name: Run all checks
-        run: nix flake check --print-build-logs
+      - name: Evaluate all checks
+        run: nix flake check --no-build
+
+      - name: Run GNU and quality checks
+        run: |
+          nix build --print-build-logs --no-link \
+            .#checks.x86_64-linux.gnu \
+            .#checks.x86_64-linux.quality \
+            .#checks.x86_64-linux.scripts
+
+  musl:
+    name: musl build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Build static binary
+        run: |
+          nix build --print-build-logs --no-link \
+            .#checks.x86_64-linux.musl
