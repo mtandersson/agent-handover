@@ -1,3 +1,9 @@
+## [0.6.2](https://github.com/mtandersson/agent-handover/compare/v0.6.1...v0.6.2) (2026-08-31)
+
+### Bug Fixes
+
+* **deps:** update rust crate time to v0.3.55 ([d677898](https://github.com/mtandersson/agent-handover/commit/d6778986e9e95919e6483d560ff6649c9bd02bdb))
+
 ## [0.6.1](https://github.com/mtandersson/agent-handover/compare/v0.6.0...v0.6.1) (2026-08-31)
 
 ### Bug Fixes
