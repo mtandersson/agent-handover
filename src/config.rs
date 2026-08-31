@@ -7,13 +7,19 @@ use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 const APPLICATION_DIRECTORY: &str = "agent-handover";
 const CONFIG_FILE: &str = "config.toml";
+const NTN_TOKEN_TIMEOUT: Duration = Duration::from_secs(5);
+const NTN_TOKEN_OUTPUT_LIMIT: usize = 4 * 1024;
 
-#[derive(Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub notion: NotionConfig,
     pub task_properties: TaskProperties,
@@ -22,12 +28,224 @@ pub struct Config {
     pub runner: RunnerConfig,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    notion: FileNotionConfig,
+    task_properties: TaskProperties,
+    task_values: TaskValues,
+    codex: CodexConfig,
+    runner: RunnerConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileNotionConfig {
+    token: Option<String>,
+    task_data_source_id: String,
+    journal_data_source_id: String,
+}
+
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct NotionConfig {
     pub token: String,
     pub task_data_source_id: String,
     pub journal_data_source_id: String,
+}
+
+trait NotionTokenResolver {
+    fn resolve(&self) -> Result<String, String>;
+}
+
+struct NtnTokenResolver {
+    executable: PathBuf,
+    timeout: Duration,
+    output_limit: usize,
+}
+
+impl Default for NtnTokenResolver {
+    fn default() -> Self {
+        Self {
+            executable: PathBuf::from("ntn"),
+            timeout: NTN_TOKEN_TIMEOUT,
+            output_limit: NTN_TOKEN_OUTPUT_LIMIT,
+        }
+    }
+}
+
+impl NotionTokenResolver for NtnTokenResolver {
+    fn resolve(&self) -> Result<String, String> {
+        let mut child = Command::new(&self.executable)
+            .args(["auth", "token", "--plain"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            // Credential discovery intentionally uses the runner's inherited
+            // user environment (PATH, HOME/XDG, keyring, and ntn overrides).
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "cannot resolve Notion token: ntn is unavailable; configure notion.token or install ntn"
+                        .to_owned()
+                } else {
+                    "cannot resolve Notion token: ntn could not be started; configure notion.token or check ntn"
+                        .to_owned()
+                }
+            })?;
+        let process_group = child.id() as libc::pid_t;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "cannot resolve Notion token: ntn output was unavailable".to_owned())?;
+        let output_limit = self.output_limit;
+        let (output_sender, output_receiver) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || {
+            let mut output = Vec::new();
+            let result = stdout
+                .take((output_limit + 1) as u64)
+                .read_to_end(&mut output)
+                .map(|_| output);
+            let _ = output_sender.send(result);
+        });
+
+        let deadline = Instant::now() + self.timeout;
+        let successful = loop {
+            match child_exited_without_reaping(child.id()) {
+                Ok(Some(successful)) => break successful,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    terminate_process_group(&mut child, process_group, reader)?;
+                    return Err(
+                        "cannot resolve Notion token: ntn timed out; configure notion.token or check ntn authentication"
+                            .to_owned(),
+                    );
+                }
+                Err(()) => {
+                    terminate_process_group(&mut child, process_group, reader)?;
+                    return Err(
+                        "cannot resolve Notion token: ntn execution failed; configure notion.token or check ntn authentication"
+                            .to_owned(),
+                    );
+                }
+            }
+        };
+        if !successful {
+            terminate_process_group(&mut child, process_group, reader)?;
+            return Err(
+                "cannot resolve Notion token: ntn is unauthenticated or failed; run `ntn login` or configure notion.token"
+                    .to_owned(),
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let output = match output_receiver.recv_timeout(remaining) {
+            Ok(output) => output,
+            Err(_) => {
+                terminate_process_group(&mut child, process_group, reader)?;
+                return Err("cannot resolve Notion token: ntn output timed out".to_owned());
+            }
+        };
+        let status = child.wait();
+        let reader_result = reader
+            .join()
+            .map_err(|_| "cannot resolve Notion token: ntn output could not be read".to_owned());
+        let status =
+            status.map_err(|_| "cannot resolve Notion token: ntn execution failed".to_owned())?;
+        reader_result?;
+        let output = output
+            .map_err(|_| "cannot resolve Notion token: ntn output could not be read".to_owned())?;
+        if !status.success() {
+            return Err(
+                "cannot resolve Notion token: ntn is unauthenticated or failed; run `ntn login` or configure notion.token"
+                    .to_owned(),
+            );
+        }
+        normalize_resolved_token(output, self.output_limit)
+    }
+}
+
+fn child_exited_without_reaping(pid: u32) -> Result<Option<bool>, ()> {
+    loop {
+        let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `information` points to writable storage for siginfo_t, the
+        // PID is the retained direct child, and waitid initializes it on
+        // success.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                information.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid returned success and initialized siginfo_t.
+            let information = unsafe { information.assume_init() };
+            if unsafe { information.si_pid() } == 0 {
+                return Ok(None);
+            }
+            let successful = information.si_code == libc::CLD_EXITED
+                // SAFETY: waitid reported an exited child, so si_status is set.
+                && unsafe { information.si_status() } == 0;
+            return Ok(Some(successful));
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(());
+        }
+    }
+}
+
+fn terminate_process_group<T>(
+    child: &mut Child,
+    process_group: libc::pid_t,
+    reader: thread::JoinHandle<T>,
+) -> Result<ExitStatus, String> {
+    // The unreaped child remains the process-group leader, preventing its PGID
+    // from being reused between exit observation and this group signal. Check
+    // that identity again before signaling so an anomalous wait cannot target
+    // an unrelated group.
+    // SAFETY: process_group is the positive PID returned for the child that was
+    // launched with process_group(0).
+    let observed_group = unsafe { libc::getpgid(process_group) };
+    let (signal_result, signal_error) = if observed_group == process_group {
+        // SAFETY: the retained child still leads this dedicated group;
+        // negation addresses that group rather than an individual process.
+        let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+        (result, std::io::Error::last_os_error())
+    } else if observed_group == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        (0, std::io::Error::from_raw_os_error(libc::ESRCH))
+    } else {
+        (-1, std::io::Error::from_raw_os_error(libc::EINVAL))
+    };
+    let status = child.wait();
+    let reader_result = reader
+        .join()
+        .map_err(|_| "cannot resolve Notion token: ntn cleanup failed".to_owned());
+    let status =
+        status.map_err(|_| "cannot resolve Notion token: ntn cleanup failed".to_owned())?;
+    reader_result?;
+    if signal_result != 0 && signal_error.raw_os_error() != Some(libc::ESRCH) {
+        return Err("cannot resolve Notion token: ntn cleanup failed".to_owned());
+    }
+    Ok(status)
+}
+
+fn normalize_resolved_token(output: Vec<u8>, output_limit: usize) -> Result<String, String> {
+    if output.len() > output_limit {
+        return Err("cannot resolve Notion token: ntn returned oversized output".to_owned());
+    }
+    let output = String::from_utf8(output)
+        .map_err(|_| "cannot resolve Notion token: ntn returned an invalid token".to_owned())?;
+    let token = output.trim();
+    if token.is_empty() || !token.chars().all(|character| character.is_ascii_graphic()) {
+        return Err("cannot resolve Notion token: ntn returned an invalid token".to_owned());
+    }
+    Ok(token.to_owned())
 }
 
 impl fmt::Debug for NotionConfig {
@@ -173,6 +391,13 @@ fn environment_base(
 }
 
 pub fn load(paths: &HostPaths) -> Result<Config, String> {
+    load_with_resolver(paths, &NtnTokenResolver::default())
+}
+
+fn load_with_resolver(
+    paths: &HostPaths,
+    token_resolver: &dyn NotionTokenResolver,
+) -> Result<Config, String> {
     ensure_private_parent(&paths.config_file)?;
     ensure_private_directory(&paths.state_directory)?;
     let mut file = open_sensitive_file(&paths.config_file)?;
@@ -183,12 +408,27 @@ pub fn load(paths: &HostPaths) -> Result<Config, String> {
             paths.config_file.display()
         )
     })?;
-    let config = toml::from_str::<Config>(&contents).map_err(|_| {
+    let file_config = toml::from_str::<FileConfig>(&contents).map_err(|_| {
         format!(
             "invalid configuration file {}: check TOML syntax and required fields",
             paths.config_file.display()
         )
     })?;
+    let token = match file_config.notion.token {
+        Some(token) => token,
+        None => token_resolver.resolve()?,
+    };
+    let config = Config {
+        notion: NotionConfig {
+            token,
+            task_data_source_id: file_config.notion.task_data_source_id,
+            journal_data_source_id: file_config.notion.journal_data_source_id,
+        },
+        task_properties: file_config.task_properties,
+        task_values: file_config.task_values,
+        codex: file_config.codex,
+        runner: file_config.runner,
+    };
     validate(&config)?;
     Ok(config)
 }
@@ -400,14 +640,29 @@ fn validate_endpoint_path(name: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::ffi::OsString;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::fs::symlink;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    static NTN_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct FakeTokenResolver {
+        calls: Cell<usize>,
+        result: Result<String, String>,
+    }
+
+    impl NotionTokenResolver for FakeTokenResolver {
+        fn resolve(&self) -> Result<String, String> {
+            self.calls.set(self.calls.get() + 1);
+            self.result.clone()
+        }
+    }
 
     fn temporary_directory() -> PathBuf {
         let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -466,6 +721,40 @@ health_path = "/health"
         HostPaths {
             config_file,
             state_directory: root.join("state/agent-handover"),
+        }
+    }
+
+    fn write_executable(root: &Path, name: &str, contents: &str) -> PathBuf {
+        let path = root.join(name);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&path)
+            .unwrap();
+        file.write_all(contents.as_bytes()).unwrap();
+        path
+    }
+
+    fn resolver(executable: PathBuf, timeout: Duration, output_limit: usize) -> NtnTokenResolver {
+        NtnTokenResolver {
+            executable,
+            timeout,
+            output_limit,
+        }
+    }
+
+    fn assert_process_disappears(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "resolver descendant {pid} was not reaped"
+            );
+            thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -581,6 +870,227 @@ health_path = "/health"
             fs::metadata(paths.state_directory).unwrap().mode() & 0o777,
             0o700
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn configured_notion_token_has_priority_without_credential_discovery() {
+        let root = temporary_directory();
+        let paths = write_fixture(&root, fixture(), 0o600);
+        let token_resolver = FakeTokenResolver {
+            calls: Cell::new(0),
+            result: Err("resolver must not run".to_owned()),
+        };
+        let config = load_with_resolver(&paths, &token_resolver).unwrap();
+        assert_eq!(config.notion.token, "secret-placeholder");
+        assert_eq!(token_resolver.calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicitly_configured_empty_token_is_rejected_without_fallback() {
+        let root = temporary_directory();
+        let contents = fixture().replace("token = \"secret-placeholder\"", "token = \" \"");
+        let paths = write_fixture(&root, &contents, 0o600);
+        let token_resolver = FakeTokenResolver {
+            calls: Cell::new(0),
+            result: Ok("resolved-placeholder".to_owned()),
+        };
+        assert_eq!(
+            load_with_resolver(&paths, &token_resolver).unwrap_err(),
+            "configuration field notion.token must not be empty"
+        );
+        assert_eq!(token_resolver.calls.get(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_notion_token_uses_resolved_credential() {
+        let root = temporary_directory();
+        let contents = fixture().replace("token = \"secret-placeholder\"\n", "");
+        let paths = write_fixture(&root, &contents, 0o600);
+        let token_resolver = FakeTokenResolver {
+            calls: Cell::new(0),
+            result: Ok("resolved-placeholder".to_owned()),
+        };
+        let config = load_with_resolver(&paths, &token_resolver).unwrap();
+        assert_eq!(config.notion.token, "resolved-placeholder");
+        assert_eq!(token_resolver.calls.get(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_notion_token_requires_successful_credential_discovery() {
+        let root = temporary_directory();
+        let contents = fixture().replace("token = \"secret-placeholder\"\n", "");
+        let paths = write_fixture(&root, &contents, 0o600);
+        let token_resolver = FakeTokenResolver {
+            calls: Cell::new(0),
+            result: Err("credential discovery unavailable".to_owned()),
+        };
+        assert_eq!(
+            load_with_resolver(&paths, &token_resolver).unwrap_err(),
+            "credential discovery unavailable"
+        );
+        assert_eq!(token_resolver.calls.get(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_token_command_is_noninteractive_and_trims_outer_whitespace() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let executable = write_executable(
+            &root,
+            "ntn-placeholder",
+            "#!/bin/sh\n[ \"$1 $2 $3\" = \"auth token --plain\" ] || exit 9\nprintf '  resolved-placeholder\\n'\n",
+        );
+        let token = resolver(executable, Duration::from_secs(1), 128)
+            .resolve()
+            .unwrap();
+        assert_eq!(token, "resolved-placeholder");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_token_command_rejects_invalid_and_oversized_output() {
+        assert!(
+            normalize_resolved_token(b"first-placeholder\nsecond-placeholder\n".to_vec(), 128)
+                .unwrap_err()
+                .contains("invalid token")
+        );
+        assert!(
+            normalize_resolved_token(b"placeholder".to_vec(), 4)
+                .unwrap_err()
+                .contains("oversized output")
+        );
+        assert!(
+            normalize_resolved_token(b" \n\t".to_vec(), 128)
+                .unwrap_err()
+                .contains("invalid token")
+        );
+    }
+
+    #[test]
+    fn ntn_token_command_limits_captured_output() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let executable = write_executable(
+            &root,
+            "ntn-verbose-placeholder",
+            "#!/bin/sh\nprintf 'oversized-placeholder'\n",
+        );
+        let error = resolver(executable, Duration::from_secs(1), 4)
+            .resolve()
+            .unwrap_err();
+        assert!(error.contains("oversized output"));
+        assert!(!error.contains("placeholder"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_token_command_bounds_execution_time() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let executable =
+            write_executable(&root, "ntn-slow-placeholder", "#!/bin/sh\nexec sleep 2\n");
+        let error = resolver(executable, Duration::from_millis(25), 128)
+            .resolve()
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_timeout_terminates_descendants_that_inherit_stdout() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let pid_file = root.join("descendant.pid");
+        let executable = write_executable(
+            &root,
+            "ntn-descendant-placeholder",
+            &format!(
+                "#!/bin/sh\nsleep 30 &\ndescendant=$!\nprintf '%s' \"$descendant\" > {}\nwait \"$descendant\"\n",
+                pid_file.display()
+            ),
+        );
+        let started = Instant::now();
+        let error = resolver(executable, Duration::from_millis(100), 128)
+            .resolve()
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let pid = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+        assert_process_disappears(pid);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_output_timeout_cleans_descendants_and_reader_threads_repeatedly() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let executable = root.join("ntn-orphan-placeholder");
+        for attempt in 0..3 {
+            let pid_file = root.join(format!("descendant-{attempt}.pid"));
+            if attempt == 0 {
+                write_executable(
+                    &root,
+                    "ntn-orphan-placeholder",
+                    &format!(
+                        "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > {}\nexit 0\n",
+                        pid_file.display()
+                    ),
+                );
+            } else {
+                let script = format!(
+                    "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > {}\nexit 0\n",
+                    pid_file.display()
+                );
+                fs::write(&executable, script).unwrap();
+                fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let started = Instant::now();
+            let error = resolver(executable.clone(), Duration::from_millis(100), 128)
+                .resolve()
+                .unwrap_err();
+            assert!(error.contains("output timed out"));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let pid = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
+            assert_process_disappears(pid);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ntn_token_command_failures_do_not_expose_command_output() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let executable = write_executable(
+            &root,
+            "ntn-failing-placeholder",
+            "#!/bin/sh\nprintf 'stdout-secret-placeholder'\nprintf 'stderr-secret-placeholder' >&2\nexit 1\n",
+        );
+        let error = resolver(executable, Duration::from_secs(1), 128)
+            .resolve()
+            .unwrap_err();
+        assert!(error.contains("unauthenticated or failed"));
+        assert!(!error.contains("secret-placeholder"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unavailable_ntn_has_an_actionable_error() {
+        let _process_guard = NTN_PROCESS_TEST_LOCK.lock().unwrap();
+        let root = temporary_directory();
+        let error = resolver(
+            root.join("missing-ntn-placeholder"),
+            Duration::from_secs(1),
+            128,
+        )
+        .resolve()
+        .unwrap_err();
+        assert!(error.contains("ntn is unavailable"));
+        assert!(error.contains("configure notion.token"));
         fs::remove_dir_all(root).unwrap();
     }
 
