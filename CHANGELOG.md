@@ -1,3 +1,9 @@
+## [0.7.0](https://github.com/mtandersson/agent-handover/compare/v0.6.2...v0.7.0) (2026-08-31)
+
+### Features
+
+* **config:** resolve Notion token from ntn ([65138fc](https://github.com/mtandersson/agent-handover/commit/65138fc5a2faa2410e2ed600ff0a325363609095))
+
 ## [0.6.2](https://github.com/mtandersson/agent-handover/compare/v0.6.1...v0.6.2) (2026-08-31)
 
 ### Bug Fixes
