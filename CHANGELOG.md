@@ -1,3 +1,13 @@
+## [0.6.1](https://github.com/mtandersson/agent-handover/compare/v0.6.0...v0.6.1) (2026-08-31)
+
+### Bug Fixes
+
+* **config:** keep executor choice private ([e1d753b](https://github.com/mtandersson/agent-handover/commit/e1d753b5557a37e9514f06803162df127f1d18ed))
+
+### Chores
+
+* **deps:** configure Renovate commits ([38366b6](https://github.com/mtandersson/agent-handover/commit/38366b666f7924c8be198271a0e52ee3fc72f707))
+
 ## [0.6.0](https://github.com/mtandersson/agent-handover/compare/v0.5.0...v0.6.0) (2026-08-31)
 
 ### Features
