@@ -1,0 +1,427 @@
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+
+const ATTEMPTS_DIRECTORY: &str = "attempts";
+const LOCK_FILE: &str = "runner.lock";
+const RECORD_VERSION: u8 = 1;
+const MAX_TASK_KEY_BYTES: usize = 512;
+const MAX_RECORD_BYTES: u64 = 4096;
+
+#[derive(Clone)]
+pub(crate) struct AttemptStore {
+    state_directory: PathBuf,
+}
+
+pub(crate) struct LockedAttemptStore {
+    attempts_directory: PathBuf,
+    _lock: File,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedAttempt {
+    version: u8,
+    run_id: String,
+    task_key: String,
+    state: AttemptState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AttemptState {
+    Prepared,
+}
+
+impl AttemptStore {
+    pub(crate) fn new(state_directory: PathBuf) -> Self {
+        Self { state_directory }
+    }
+
+    pub(crate) fn acquire(&self) -> Result<LockedAttemptStore, String> {
+        crate::config::ensure_private_directory(&self.state_directory)
+            .map_err(|_| "cannot prepare private state directory".to_owned())?;
+        let attempts_directory = self.state_directory.join(ATTEMPTS_DIRECTORY);
+        crate::config::ensure_private_directory(&attempts_directory)
+            .map_err(|_| "cannot prepare private attempts directory".to_owned())?;
+        let lock = open_private_lock(&self.state_directory.join(LOCK_FILE))?;
+        lock_exclusively(&lock)?;
+        Ok(LockedAttemptStore {
+            attempts_directory,
+            _lock: lock,
+        })
+    }
+}
+
+impl LockedAttemptStore {
+    pub(crate) fn prepare(&self, task_key: &str) -> Result<PreparedAttempt, String> {
+        validate_task_key(task_key)?;
+        loop {
+            let run_id = generate_run_id()?;
+            let attempt = PreparedAttempt {
+                version: RECORD_VERSION,
+                run_id: run_id.clone(),
+                task_key: task_key.to_owned(),
+                state: AttemptState::Prepared,
+            };
+            match persist_new_record(&self.attempts_directory, &run_id, &attempt) {
+                Ok(()) => return Ok(attempt),
+                Err(PersistError::Collision) => continue,
+                Err(PersistError::Failure(message)) => return Err(message),
+            }
+        }
+    }
+
+    pub(crate) fn load(&self, run_id: &str) -> Result<PreparedAttempt, String> {
+        validate_run_id(run_id)?;
+        let path = self.attempts_directory.join(format!("{run_id}.json"));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    "prepared attempt does not exist".to_owned()
+                } else {
+                    "cannot safely open prepared attempt".to_owned()
+                }
+            })?;
+        validate_private_file(&file, "prepared attempt")?;
+        if file
+            .metadata()
+            .map_err(|_| "cannot inspect prepared attempt".to_owned())?
+            .len()
+            > MAX_RECORD_BYTES
+        {
+            return Err("prepared attempt is oversized".to_owned());
+        }
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|_| "cannot read prepared attempt".to_owned())?;
+        let attempt: PreparedAttempt = serde_json::from_slice(&contents)
+            .map_err(|_| "prepared attempt is invalid".to_owned())?;
+        if attempt.version != RECORD_VERSION
+            || attempt.run_id != run_id
+            || validate_task_key(&attempt.task_key).is_err()
+        {
+            return Err("prepared attempt is invalid".to_owned());
+        }
+        Ok(attempt)
+    }
+
+    pub(crate) fn list_prepared(&self) -> Result<Vec<PreparedAttempt>, String> {
+        let entries = fs::read_dir(&self.attempts_directory)
+            .map_err(|_| "cannot list prepared attempts".to_owned())?;
+        let mut run_ids = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|_| "cannot list prepared attempts".to_owned())?;
+            let name = entry.file_name();
+            let name = name
+                .to_str()
+                .ok_or_else(|| "prepared attempt filename is invalid".to_owned())?;
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                continue;
+            }
+            let run_id = name
+                .strip_suffix(".json")
+                .ok_or_else(|| "prepared attempt filename is invalid".to_owned())?;
+            validate_run_id(run_id)?;
+            run_ids.push(run_id.to_owned());
+        }
+        run_ids.sort_unstable();
+        run_ids.iter().map(|run_id| self.load(run_id)).collect()
+    }
+}
+
+impl PreparedAttempt {
+    pub(crate) fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub(crate) fn task_key(&self) -> &str {
+        &self.task_key
+    }
+}
+
+fn open_private_lock(path: &Path) -> Result<File, String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| "cannot safely open runner process lock".to_owned())?;
+    validate_regular_file(&file, "runner process lock")?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot secure runner process lock".to_owned())?;
+    Ok(file)
+}
+
+fn lock_exclusively(file: &File) -> Result<(), String> {
+    // SAFETY: flock only observes the valid descriptor retained by `file`.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Err("another runner already holds the state directory lock".to_owned())
+    } else {
+        Err("cannot acquire runner process lock".to_owned())
+    }
+}
+
+enum PersistError {
+    Collision,
+    Failure(String),
+}
+
+fn persist_new_record(
+    directory: &Path,
+    run_id: &str,
+    attempt: &PreparedAttempt,
+) -> Result<(), PersistError> {
+    let temporary_path = directory.join(format!(".{run_id}.tmp"));
+    let final_path = directory.join(format!("{run_id}.json"));
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary_path)
+        .map_err(|_| PersistError::Failure("cannot create prepared attempt".to_owned()))?;
+    let result = (|| {
+        serde_json::to_writer(&mut temporary, attempt)
+            .map_err(|_| PersistError::Failure("cannot encode prepared attempt".to_owned()))?;
+        temporary
+            .write_all(b"\n")
+            .and_then(|_| temporary.sync_all())
+            .map_err(|_| PersistError::Failure("cannot persist prepared attempt".to_owned()))?;
+        fs::hard_link(&temporary_path, &final_path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                PersistError::Collision
+            } else {
+                PersistError::Failure("cannot publish prepared attempt".to_owned())
+            }
+        })?;
+        sync_directory(directory)
+            .map_err(|_| PersistError::Failure("cannot persist prepared attempt".to_owned()))?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary_path);
+    let _ = sync_directory(directory);
+    result
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+fn validate_regular_file(file: &File, description: &str) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|_| format!("cannot inspect {description}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{description} is not a regular file"));
+    }
+    Ok(())
+}
+
+fn validate_private_file(file: &File, description: &str) -> Result<(), String> {
+    validate_regular_file(file, description)?;
+    let mode = file
+        .metadata()
+        .map_err(|_| format!("cannot inspect {description}"))?
+        .mode()
+        & 0o777;
+    if mode != 0o600 {
+        return Err(format!("{description} is not private"));
+    }
+    Ok(())
+}
+
+fn validate_task_key(task_key: &str) -> Result<(), String> {
+    if task_key.is_empty()
+        || task_key.len() > MAX_TASK_KEY_BYTES
+        || task_key.chars().any(char::is_control)
+    {
+        return Err(
+            "task key must be non-empty, bounded, and contain no control characters".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn generate_run_id() -> Result<String, String> {
+    let mut bytes = [0_u8; 16];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: the remaining slice is valid writable memory for the given
+        // byte count; getrandom does not retain the pointer.
+        let result = unsafe {
+            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
+        };
+        if result > 0 {
+            filled += result as usize;
+        } else if result == -1
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+        {
+            continue;
+        } else {
+            return Err("cannot generate run ID".to_owned());
+        }
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    ))
+}
+
+fn validate_run_id(run_id: &str) -> Result<(), String> {
+    let bytes = run_id.as_bytes();
+    if bytes.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 8 | 13 | 18 | 23) && !byte.is_ascii_hexdigit())
+    {
+        return Err("run ID is invalid".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    fn temporary_directory() -> PathBuf {
+        let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "agent-handover-state-test-{}-{suffix}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn rejects_a_second_runner_until_the_first_releases_the_lock() {
+        let directory = temporary_directory();
+        let first_store = AttemptStore::new(directory.clone());
+        let second_store = AttemptStore::new(directory.clone());
+
+        let first_lock = first_store.acquire().unwrap();
+        assert_eq!(
+            second_store.acquire().err().as_deref(),
+            Some("another runner already holds the state directory lock")
+        );
+        drop(first_lock);
+        second_store.acquire().unwrap();
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepared_attempt_survives_a_new_store_instance() {
+        let directory = temporary_directory();
+        let expected_run_id = {
+            let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+            let attempt = locked.prepare("task-placeholder").unwrap();
+            assert_eq!(attempt.task_key(), "task-placeholder");
+            attempt.run_id().to_owned()
+        };
+
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let attempts = reopened.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 1);
+        let attempt = &attempts[0];
+        assert_eq!(attempt.run_id(), expected_run_id);
+        assert_eq!(attempt.task_key(), "task-placeholder");
+        drop(reopened);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn every_prepared_attempt_has_a_distinct_immutable_run_id() {
+        let directory = temporary_directory();
+        let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+
+        let first = locked.prepare("task-placeholder").unwrap();
+        let second = locked.prepare("task-placeholder").unwrap();
+
+        assert_ne!(first.run_id(), second.run_id());
+        assert!(locked.load(first.run_id()).is_ok());
+        assert!(locked.load(second.run_id()).is_ok());
+        drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn prepared_record_is_private_and_contains_only_local_authority_fields() {
+        let directory = temporary_directory();
+        let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let attempt = locked.prepare("task-placeholder").unwrap();
+        let path = directory
+            .join(ATTEMPTS_DIRECTORY)
+            .join(format!("{}.json", attempt.run_id()));
+        let metadata = fs::metadata(&path).unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&contents).unwrap(),
+            serde_json::json!({
+                "version": 1,
+                "run_id": attempt.run_id(),
+                "task_key": "task-placeholder",
+                "state": "prepared"
+            })
+        );
+        for excluded in ["prompt", "instruction", "output", "secret", "/home/"] {
+            assert!(!contents.contains(excluded));
+        }
+        drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn state_diagnostics_do_not_expose_host_specific_paths() {
+        let directory = temporary_directory();
+        let state_path = directory.join("host-specific-value");
+        fs::create_dir_all(&directory).unwrap();
+        File::create(&state_path).unwrap();
+
+        let error = AttemptStore::new(state_path).acquire().err().unwrap();
+
+        assert_eq!(error, "cannot prepare private state directory");
+        assert!(!error.contains("host-specific-value"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

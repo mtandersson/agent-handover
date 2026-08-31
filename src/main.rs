@@ -7,6 +7,8 @@ mod discovery;
 mod enrollment;
 mod http;
 mod notion;
+#[allow(dead_code)]
+mod state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Command {
