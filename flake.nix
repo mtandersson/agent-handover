@@ -49,7 +49,7 @@
         pname = "agent-handover-release-tooling";
         version = "25.0.9";
         src = ./release-tooling;
-        npmDepsHash = "sha256-pocymPhGmIbKitmbruDcu7FP73JXsckcs9+6aNU+NsM=";
+        npmDepsHash = "sha256-SDCeTetjPUX1MzgViIvfeBo8R4izU1u7qp1PpzhbfTg=";
         dontNpmBuild = true;
         nativeBuildInputs = [ pkgs.makeWrapper ];
         postInstall = ''
