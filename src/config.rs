@@ -58,14 +58,12 @@ impl fmt::Debug for Config {
 #[serde(deny_unknown_fields)]
 pub struct TaskProperties {
     pub title: String,
-    pub executor: String,
     pub status: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskValues {
-    pub codex: String,
     pub pending: String,
     pub running: String,
     pub error: String,
@@ -301,14 +299,9 @@ fn validate(config: &Config) -> Result<(), String> {
             config.task_properties.title.as_str(),
         ),
         (
-            "task_properties.executor",
-            config.task_properties.executor.as_str(),
-        ),
-        (
             "task_properties.status",
             config.task_properties.status.as_str(),
         ),
-        ("task_values.codex", config.task_values.codex.as_str()),
         ("codex.profile", config.codex.profile.as_str()),
     ] {
         if value.trim().is_empty() {
@@ -318,11 +311,10 @@ fn validate(config: &Config) -> Result<(), String> {
 
     let property_names = [
         config.task_properties.title.as_str(),
-        config.task_properties.executor.as_str(),
         config.task_properties.status.as_str(),
     ];
     if property_names.into_iter().collect::<HashSet<_>>().len() != property_names.len() {
-        return Err("task title, executor, and status property names must be distinct".to_owned());
+        return Err("task title and status property names must be distinct".to_owned());
     }
 
     let statuses = [
@@ -436,11 +428,9 @@ journal_data_source_id = "journal-data-source-placeholder"
 
 [task_properties]
 title = "Name"
-executor = "Executor"
 status = "Status"
 
 [task_values]
-codex = "Codex"
 pending = "Pending"
 running = "Running"
 error = "Error"
@@ -579,7 +569,7 @@ health_path = "/health"
 
         let config = load(&paths).unwrap();
 
-        assert_eq!(config.task_values.codex, "Codex");
+        assert_eq!(config.codex.executable, Path::new("codex"));
         assert_eq!(
             fs::metadata(paths.config_file.parent().unwrap())
                 .unwrap()
@@ -615,6 +605,26 @@ health_path = "/health"
             "configuration field task_properties.status must not be empty"
         );
         assert!(!error.contains("secret-placeholder"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_legacy_notion_executor_mappings() {
+        let root = temporary_directory();
+        let contents = fixture()
+            .replace(
+                "title = \"Name\"",
+                "title = \"Name\"\nexecutor = \"Executor\"",
+            )
+            .replace(
+                "pending = \"Pending\"",
+                "codex = \"Codex\"\npending = \"Pending\"",
+            );
+        let paths = write_fixture(&root, &contents, 0o600);
+        let error = load(&paths).unwrap_err();
+        assert!(error.contains("invalid configuration file"));
+        assert!(!error.contains("Executor"));
+        assert!(!error.contains("Codex"));
         fs::remove_dir_all(root).unwrap();
     }
 

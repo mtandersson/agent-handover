@@ -15,7 +15,7 @@ yet. Follow the [roadmap](#roadmap) for the remaining implementation sequence.
 
 ## Intended capabilities
 
-- Discover tasks whose `Executor` is `Codex` and `Status` is `Pending`.
+- Discover tasks whose `Status` is `Pending`.
 - Use [Notion connection webhooks][notion-webhooks] for prompt discovery and
   reconciliation for reliability.
 - Run one task at a time through [Codex's non-interactive interface][codex-exec]
@@ -24,9 +24,11 @@ yet. Follow the [roadmap](#roadmap) for the remaining implementation sequence.
   `Pending -> Running -> Done | Error`.
 - Recover interrupted bookkeeping without automatically launching Codex again.
 
-Codex is the only planned executor for the first release. The internal executor
-boundary will remain provider-neutral, but a Claude adapter, multiple host
-profiles, concurrent execution, and automatic agent retries are out of scope.
+The private host profile selects Codex as the only executor for the first
+release; task authors do not choose an executor in Notion. The internal
+executor boundary and shared journal remain provider-neutral, but a Claude
+adapter, multiple host profiles, concurrent execution, and automatic agent
+retries are out of scope.
 
 ## Architecture
 
@@ -78,7 +80,6 @@ The task data source must provide:
 | --- | --- |
 | Title | Existing task title |
 | Page body | The complete instruction source for Codex |
-| `Executor` | Select value; initially `Codex` |
 | `Status` | Status values `Pending`, `Running`, `Error`, and `Done` |
 
 The shared journal must provide one entry per attempt with:
@@ -101,8 +102,10 @@ refetches the page and reconciliation remains authoritative for discovery.
 Only page-created, page-content-updated, and page-properties-updated signals
 whose event parent names the configured task data source are considered. The
 runner then retrieves the current page through the Notion API and independently
-confirms its parent, `Executor = Codex`, and `Status = Pending` before forwarding
-it. Page retrieval uses the `2026-03-11` Notion API contract. Duplicate event
+confirms its parent and `Status = Pending` before forwarding it. The private
+host profile supplies the Codex executor; executor-like Notion properties do
+not affect eligibility. Page retrieval uses the `2026-03-11` Notion API
+contract. Duplicate event
 IDs are acknowledged without another refetch; unique events
 are not rejected by timestamp because an older delivery can still reveal newer
 authoritative state. The runner parses `last_edited_time` as an RFC 3339 instant
@@ -186,11 +189,9 @@ journal_data_source_id = "<JOURNAL_DATA_SOURCE_ID>"
 
 [task_properties]
 title = "Name"
-executor = "Executor"
 status = "Status"
 
 [task_values]
-codex = "Codex"
 pending = "Pending"
 running = "Running"
 error = "Error"
@@ -213,11 +214,12 @@ health_path = "/health"
 
 Supported sandbox values are `read-only`, `workspace-write`, and
 `danger-full-access`; the runner passes the configured policy through without
-weakening it. The bind address must include a port and use an IPv4 or IPv6
-loopback address.
-Property names and lifecycle values must be non-empty and distinct, the Codex
-working directory must be absolute, durations must be positive, and the
-environment list accepts variable names only—not values.
+weakening it. The required `[codex]` table is the private executor selection for
+this one-executor host profile. The bind address must include a port and use an
+IPv4 or IPv6 loopback address. Property names and lifecycle values must be
+non-empty and distinct, the Codex working directory must be absolute, durations
+must be positive, and the environment list accepts variable names only—not
+values.
 
 Operational state, verification tokens, prompts, agent output, run records, and
 host-specific paths must never be committed. Configuration diagnostics and
@@ -272,8 +274,8 @@ printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
 
 An eligible task follows this target lifecycle:
 
-1. Discovery confirms `Executor = Codex` and `Status = Pending` from current
-   Notion state.
+1. Discovery confirms `Status = Pending` from current Notion state; the private
+   host profile supplies Codex as the executor.
 2. The runner creates a durable local attempt with a new run ID.
 3. It changes the task to `Running`, creates the journal attempt, and verifies
    both are visible before execution.
@@ -322,8 +324,7 @@ duplicate effects.
   route is reachable, and the connection can access the changed page. Some
   Notion events are aggregated and delayed.
 - **A webhook changes nothing:** confirm the current page still has
-  `Executor = Codex` and `Status = Pending`; stale and unrelated events are
-  intentionally ignored.
+  `Status = Pending`; stale and unrelated events are intentionally ignored.
 - **A task missed its webhook:** use `run-once` after that command is implemented
   or wait for periodic reconciliation in `serve`.
 - **A task is `Error` after restart:** inspect its journal warning before

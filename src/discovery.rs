@@ -112,7 +112,6 @@ struct DispatcherInner<A, S> {
     adapter: Arc<A>,
     sink: Arc<S>,
     task_data_source_id: Arc<str>,
-    codex: Arc<str>,
     pending: Arc<str>,
     delivery: Arc<Mutex<DeliveryState>>,
     event_limit: usize,
@@ -167,7 +166,6 @@ where
                 adapter: Arc::new(adapter),
                 sink: Arc::new(sink),
                 task_data_source_id: Arc::from(notion.task_data_source_id.as_str()),
-                codex: Arc::from(values.codex.as_str()),
                 pending: Arc::from(values.pending.as_str()),
                 delivery: Arc::new(Mutex::new(DeliveryState::default())),
                 event_limit,
@@ -283,7 +281,6 @@ where
         // arrive late and still signal a newer authoritative page revision.
         let task = self.adapter.refetch_task(&event.entity.id).await?;
         let eligible = task.data_source_id.as_deref() == Some(&self.task_data_source_id)
-            && task.executor.as_deref() == Some(&self.codex)
             && task.status.as_deref() == Some(&self.pending)
             && !task.in_trash;
         if !eligible {
@@ -517,25 +514,18 @@ mod tests {
         }
     }
 
-    fn task(page: &str, source: &str, executor: &str, status: &str, revision: &str) -> TaskState {
+    fn task(page: &str, source: &str, status: &str, revision: &str) -> TaskState {
         TaskState {
             page_id: page.to_owned(),
             revision: TaskRevision::parse(revision).unwrap(),
             data_source_id: Some(source.to_owned()),
-            executor: Some(executor.to_owned()),
             status: Some(status.to_owned()),
             in_trash: false,
         }
     }
 
     fn eligible(page: &str, revision: &str) -> TaskState {
-        task(
-            page,
-            "task-source-placeholder",
-            "Codex",
-            "Pending",
-            revision,
-        )
+        task(page, "task-source-placeholder", "Pending", revision)
     }
 
     fn event(id: &str, page: &str, source: &str) -> Value {
@@ -556,7 +546,6 @@ mod tests {
                 journal_data_source_id: "journal-placeholder".to_owned(),
             },
             TaskValues {
-                codex: "Codex".to_owned(),
                 pending: "Pending".to_owned(),
                 running: "Running".to_owned(),
                 error: "Error".to_owned(),
@@ -581,21 +570,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filters_event_source_and_authoritative_state() {
+    async fn filters_event_source_and_authoritative_status_without_an_executor_field() {
         let dispatcher = dispatcher(|page, call| {
             let state = match call {
                 0 => eligible(page, "2026-01-01T00:00:00Z"),
-                1 => task(
-                    page,
-                    "task-source-placeholder",
-                    "Other",
-                    "Pending",
-                    "2026-01-02T00:00:00Z",
-                ),
                 _ => task(
                     page,
                     "task-source-placeholder",
-                    "Codex",
                     "Running",
                     "2026-01-03T00:00:00Z",
                 ),
@@ -606,13 +587,13 @@ mod tests {
             .dispatch(event("unrelated", "p", "other"))
             .await
             .unwrap();
-        for id in ["eligible", "other-executor", "feedback"] {
+        for id in ["eligible", "feedback"] {
             dispatcher
                 .dispatch(event(id, "p", "task-source-placeholder"))
                 .await
                 .unwrap();
         }
-        assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
         let discovered = dispatcher.inner.sink.0.lock().unwrap();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].instructions, "instructions for p");

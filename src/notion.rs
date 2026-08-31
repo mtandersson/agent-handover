@@ -21,7 +21,6 @@ pub struct TaskState {
     pub page_id: String,
     pub revision: TaskRevision,
     pub data_source_id: Option<String>,
-    pub executor: Option<String>,
     pub status: Option<String>,
     pub in_trash: bool,
 }
@@ -294,21 +293,12 @@ fn parse_task(
             .pointer("/parent/data_source_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        executor: select_name(values.get(&properties.executor)),
         status: status_name(values.get(&properties.status)),
         in_trash: page
             .get("in_trash")
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
-}
-
-fn select_name(property: Option<&Value>) -> Option<String> {
-    property?
-        .get("select")?
-        .get("name")?
-        .as_str()
-        .map(str::to_owned)
 }
 
 fn status_name(property: Option<&Value>) -> Option<String> {
@@ -329,7 +319,6 @@ mod tests {
     fn properties() -> TaskProperties {
         TaskProperties {
             title: "Name".to_owned(),
-            executor: "Executor field".to_owned(),
             status: "Status field".to_owned(),
         }
     }
@@ -380,7 +369,6 @@ mod tests {
             "parent": {"type": "data_source_id", "data_source_id": "source-placeholder"},
             "in_trash": false,
             "properties": {
-                "Executor field": {"type": "select", "select": {"name": "Codex"}},
                 "Status field": {"type": "status", "status": {"name": "Pending"}}
             }
         })
@@ -396,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_only_the_configured_select_and_status_properties() {
+    fn parses_only_the_configured_status_and_ignores_executor_like_properties() {
         let page = json!({
             "object": "page",
             "id": "page-placeholder",
@@ -404,7 +392,7 @@ mod tests {
             "parent": {"type": "data_source_id", "data_source_id": "source-placeholder"},
             "in_trash": false,
             "properties": {
-                "Executor field": {"type": "select", "select": {"name": "Codex"}},
+                "Executor": {"type": "select", "select": {"name": "Other"}},
                 "Status field": {"type": "status", "status": {"name": "Pending"}},
                 "Prompt": {"type": "rich_text", "rich_text": [{"plain_text": "private"}]}
             }
@@ -417,7 +405,6 @@ mod tests {
                 page_id: "page-placeholder".to_owned(),
                 revision: TaskRevision::parse("2026-01-01T00:00:00Z").unwrap(),
                 data_source_id: Some("source-placeholder".to_owned()),
-                executor: Some("Codex".to_owned()),
                 status: Some("Pending".to_owned()),
                 in_trash: false,
             }
