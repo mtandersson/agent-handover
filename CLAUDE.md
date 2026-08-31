@@ -17,6 +17,8 @@ The project is currently a minimal Rust CLI:
 
 - `src/main.rs`: current command entry point and its unit tests.
 - `src/config.rs`: private XDG host configuration and path contracts.
+- `src/notion/content.rs`: private bounded Notion block traversal and
+  deterministic Markdown rendering behind the Notion adapter.
 - `src/discovery.rs`: webhook signal filtering, authoritative refetch policy,
   and the downstream discovery boundary.
 - `src/enrollment.rs`: fakeable webhook-token enrollment and private file storage.

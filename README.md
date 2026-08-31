@@ -7,9 +7,10 @@ and durable launch state on one private host.
 
 The repository contains the Rust CLI, private host configuration foundation,
 webhook-token enrollment, authenticated webhook HTTP intake, authoritative
-Notion task refetching, and build and release tooling. `serve` exposes the
-configured health and webhook routes and forwards only currently eligible task
-discoveries to the orchestration boundary; it does not enqueue or launch Codex
+Notion task refetching, deterministic task-body rendering, and build and
+release tooling. `serve` exposes the configured health and webhook routes and
+forwards only currently eligible tasks, with their rendered instruction
+documents, to the orchestration boundary; it does not enqueue or launch Codex
 yet. Follow the [roadmap](#roadmap) for the remaining implementation sequence.
 
 ## Intended capabilities
@@ -110,6 +111,29 @@ never follows a newer cached revision to the discovery boundary. The bounded
 revision cache still recognizes a later manual `Error -> Pending` revision even
 when the intermediate non-Pending webhook was not observed. Runner-owned
 transitions to `Running`, `Done`, or `Error` are ignored as feedback signals.
+
+For each eligible revision, the runner retrieves every page of
+[block children][notion-blocks] and traverses nested content depth-first in
+stable Notion source order. The resulting deterministic Markdown is the sole
+task instruction document sent to the orchestration boundary and is never
+included in normal logs or errors.
+Paragraphs, headings, lists, tasks, toggles, quotes, callouts, code, equations,
+dividers, tables, columns, tabs, templates, and synced blocks have explicit
+rendering or structural behavior. Tabs are transparent containers whose
+ordinary children remain in source order. Table rows use deterministic
+structural list items so they remain valid Markdown without inventing a header
+row. Rich-text annotations and ordinary HTTP(S) links are preserved; mentions
+are rendered as inert labels without following targets.
+
+Child pages, child databases, linked pages, bookmarks, embeds, link previews,
+files, images, video, audio, and PDFs are represented by safe labels and are
+never fetched automatically. Unknown and Notion `unsupported` blocks produce a
+deterministic unsupported-block label. Meeting notes, breadcrumbs, and tables
+of contents are also represented without following generated references.
+Traversal is serial within a task and is bounded to 32 nested levels, 10,000
+blocks, 10,000 paginated responses, 16 MiB of source responses, and 1 MiB of
+rendered Markdown. Each response is independently limited to 1 MiB and five
+seconds; cursor and child cycles are rejected with content-free diagnostics.
 
 Webhook request bodies are limited to 1 MiB and must arrive within five
 seconds. Oversized requests receive `413 Payload Too Large`; slow request bodies
@@ -367,3 +391,4 @@ Licensed under the [MIT License](LICENSE).
 [notion-automations]: https://www.notion.com/help/database-automations
 [notion-delivery]: https://developers.notion.com/reference/webhooks-events-delivery
 [notion-webhooks]: https://developers.notion.com/reference/webhooks
+[notion-blocks]: https://developers.notion.com/reference/block

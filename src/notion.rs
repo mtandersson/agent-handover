@@ -1,3 +1,6 @@
+mod content;
+
+use self::content::{BlockPage, BlockSource};
 use crate::config::{NotionConfig, TaskProperties};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
@@ -52,6 +55,11 @@ pub trait NotionAdapter: Send + Sync + 'static {
         &'a self,
         page_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<TaskState, String>> + Send + 'a>>;
+
+    fn render_task<'a>(
+        &'a self,
+        page_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 }
 
 pub struct NotionHttpClient {
@@ -138,6 +146,72 @@ impl NotionHttpClient {
             .map_err(|_| "Notion returned an invalid task response".to_owned())?;
         parse_task(page_id, &page, &self.properties)
     }
+
+    async fn retrieve_block_page(
+        &self,
+        parent_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<BlockPage, String> {
+        let mut url = self.api_root.clone();
+        url.path_segments_mut()
+            .map_err(|_| "cannot initialize Notion API client".to_owned())?
+            .extend(["v1", "blocks", parent_id, "children"]);
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("page_size", "100");
+            if let Some(cursor) = cursor {
+                query.append_pair("start_cursor", cursor);
+            }
+        }
+        let (value, response_bytes) = self
+            .get_json(
+                url,
+                "cannot retrieve task content from Notion",
+                "Notion refused the task content request",
+                "Notion task content response exceeds the size limit",
+                "cannot read the Notion task content response",
+                "Notion returned an invalid block response",
+            )
+            .await?;
+        let mut page = parse_block_page(&value)?;
+        page.response_bytes = response_bytes;
+        Ok(page)
+    }
+
+    async fn get_json(
+        &self,
+        url: reqwest::Url,
+        send_error: &str,
+        status_error: &str,
+        size_error: &str,
+        read_error: &str,
+        parse_error: &str,
+    ) -> Result<(Value, usize), String> {
+        let mut response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|_| send_error.to_owned())?;
+        if !response.status().is_success() {
+            return Err(status_error.to_owned());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            return Err(size_error.to_owned());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| read_error.to_owned())? {
+            if body.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err(size_error.to_owned());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value = serde_json::from_slice(&body).map_err(|_| parse_error.to_owned())?;
+        Ok((value, body.len()))
+    }
 }
 
 impl NotionAdapter for NotionHttpClient {
@@ -147,6 +221,52 @@ impl NotionAdapter for NotionHttpClient {
     ) -> Pin<Box<dyn Future<Output = Result<TaskState, String>> + Send + 'a>> {
         Box::pin(self.retrieve(page_id))
     }
+
+    fn render_task<'a>(
+        &'a self,
+        page_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+        Box::pin(content::render_page(self, page_id))
+    }
+}
+
+impl BlockSource for NotionHttpClient {
+    fn block_page<'a>(
+        &'a self,
+        parent_id: &'a str,
+        cursor: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<BlockPage, String>> + Send + 'a>> {
+        Box::pin(self.retrieve_block_page(parent_id, cursor))
+    }
+}
+
+fn parse_block_page(value: &Value) -> Result<BlockPage, String> {
+    if value.get("object").and_then(Value::as_str) != Some("list")
+        || value.get("type").and_then(Value::as_str) != Some("block")
+    {
+        return Err("Notion returned an invalid block response".to_owned());
+    }
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Notion returned an invalid block response".to_owned())?;
+    if results.len() > 100 {
+        return Err("Notion returned an invalid block response".to_owned());
+    }
+    let has_more = value
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "Notion returned an invalid block response".to_owned())?;
+    let next_cursor = match value.get("next_cursor") {
+        Some(Value::String(cursor)) if has_more => Some(cursor.clone()),
+        Some(Value::Null) if !has_more => None,
+        _ => return Err("Notion returned an invalid block response".to_owned()),
+    };
+    Ok(BlockPage {
+        blocks: results.clone(),
+        next_cursor,
+        response_bytes: 0,
+    })
 }
 
 fn parse_task(
@@ -337,6 +457,58 @@ mod tests {
         assert!(request.starts_with("GET /v1/pages/page%2Fwith%20space HTTP/1.1\r\n"));
         assert!(lower.contains("authorization: bearer secret-placeholder\r\n"));
         assert!(lower.contains("notion-version: 2026-03-11\r\n"));
+    }
+
+    #[tokio::test]
+    async fn block_client_encodes_cursor_and_uses_current_headers_and_page_limit() {
+        let body = json!({
+            "object": "list", "type": "block", "block": {}, "results": [],
+            "has_more": false, "next_cursor": null
+        })
+        .to_string();
+        let (root, server) = fake_server(response("200 OK", &body), Duration::ZERO).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            root,
+            Duration::from_secs(1),
+            4096,
+        )
+        .unwrap();
+
+        client
+            .retrieve_block_page("block/placeholder", Some("cursor +/placeholder"))
+            .await
+            .unwrap();
+        let request = String::from_utf8(server.await.unwrap()).unwrap();
+        let lower = request.to_ascii_lowercase();
+        assert!(request.starts_with(
+            "GET /v1/blocks/block%2Fplaceholder/children?page_size=100&start_cursor=cursor+%2B%2Fplaceholder HTTP/1.1\r\n"
+        ));
+        assert!(lower.contains("authorization: bearer secret-placeholder\r\n"));
+        assert!(lower.contains("notion-version: 2026-03-11\r\n"));
+    }
+
+    #[tokio::test]
+    async fn block_client_bounds_each_response_without_exposing_content() {
+        let private = "private-content-placeholder".repeat(8);
+        let (root, server) = fake_server(response("200 OK", &private), Duration::ZERO).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            root,
+            Duration::from_secs(1),
+            32,
+        )
+        .unwrap();
+
+        let error = client
+            .retrieve_block_page("block-placeholder", None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "Notion task content response exceeds the size limit");
+        assert!(!error.contains("private-content-placeholder"));
+        server.await.unwrap();
     }
 
     #[tokio::test]
