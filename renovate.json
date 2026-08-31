@@ -3,5 +3,7 @@
   "extends": [
     "config:recommended",
     ":semanticCommits"
-  ]
+  ],
+  "automerge": true,
+  "platformAutomerge": false
 }
