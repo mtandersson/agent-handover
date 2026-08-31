@@ -1,3 +1,9 @@
+## [0.6.0](https://github.com/mtandersson/agent-handover/compare/v0.5.0...v0.6.0) (2026-08-31)
+
+### Features
+
+* **notion:** render task page instructions ([b83eaa3](https://github.com/mtandersson/agent-handover/commit/b83eaa3604e08fcc99240e03f4db704222c17dfd))
+
 ## [0.5.0](https://github.com/mtandersson/agent-handover/compare/v0.4.0...v0.5.0) (2026-08-30)
 
 ### Features
