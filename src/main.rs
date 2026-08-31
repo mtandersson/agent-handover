@@ -165,11 +165,9 @@ mod tests {
             },
             task_properties: TaskProperties {
                 title: "Name".to_owned(),
-                executor: "Executor".to_owned(),
                 status: "Status".to_owned(),
             },
             task_values: TaskValues {
-                codex: "Codex".to_owned(),
                 pending: "Pending".to_owned(),
                 running: "Running".to_owned(),
                 error: "Error".to_owned(),

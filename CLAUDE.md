@@ -53,7 +53,8 @@ Update this map when concrete modules are added or moved.
   its configured interval; make `run-once` perform the equivalent discovery and
   sequential drain once.
 - Refetch current Notion state after an authenticated event. Ignore unrelated,
-  duplicate, out-of-order, non-Pending, and non-Codex events.
+  duplicate, out-of-order, and non-Pending events. Executor choice belongs to
+  the private host profile, not a Notion task property.
 - Enforce one runner per stable local state directory with a process lock and
   execute one task at a time.
 - Use private local run records as automatic-launch authority. Notion status is
