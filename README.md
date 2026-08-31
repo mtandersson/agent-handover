@@ -183,7 +183,8 @@ host values in this form:
 
 ```toml
 [notion]
-token = "<NOTION_TOKEN>"
+# Optional when `ntn auth token --plain` can resolve a saved credential.
+token = "<NOTION_CONNECTION_TOKEN>"
 task_data_source_id = "<TASK_DATA_SOURCE_ID>"
 journal_data_source_id = "<JOURNAL_DATA_SOURCE_ID>"
 
@@ -220,6 +221,14 @@ IPv4 or IPv6 loopback address. Property names and lifecycle values must be
 non-empty and distinct, the Codex working directory must be absolute, durations
 must be positive, and the environment list accepts variable names only—not
 values.
+
+An explicit `notion.token` is always preferred. If it is omitted, the runner
+invokes `ntn auth token --plain` noninteractively using the runner process's
+user environment so `ntn` can discover its saved keyring or file credential.
+The resolved token is held only in memory and is never logged or persisted by
+the runner. An `ntn login` credential is user- and workspace-scoped and may
+grant broader access than a least-privilege internal connection. Prefer an
+explicit connection token when that narrower security boundary matters.
 
 Operational state, verification tokens, prompts, agent output, run records, and
 host-specific paths must never be committed. Configuration diagnostics and
