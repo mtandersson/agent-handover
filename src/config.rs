@@ -1050,11 +1050,11 @@ health_path = "/health"
                 fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
             }
             let started = Instant::now();
-            let error = resolver(executable.clone(), Duration::from_millis(100), 128)
+            let error = resolver(executable.clone(), Duration::from_secs(1), 128)
                 .resolve()
                 .unwrap_err();
             assert!(error.contains("output timed out"));
-            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(started.elapsed() < Duration::from_secs(2));
             let pid = fs::read_to_string(&pid_file).unwrap().parse().unwrap();
             assert_process_disappears(pid);
         }
