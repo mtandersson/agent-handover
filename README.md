@@ -31,8 +31,9 @@ adapter, multiple host profiles, concurrent execution, and automatic agent
 retries are out of scope.
 
 Private local state now provides the process-lock and prepared-attempt
-foundation for later orchestration. It is not wired into `serve` or `run-once`
-until reconciliation and sequential draining are implemented.
+foundation for later orchestration. `run-once` performs one reconciliation and
+sequentially hands the eligible observed set to the provider-neutral
+preparation boundary; `serve` is not wired to reconciliation yet.
 
 ## Architecture
 
@@ -269,7 +270,7 @@ The runner interface is:
 | Command | Target behavior |
 | --- | --- |
 | `agent-handover serve` | Serve the health and webhook routes, authenticate events, refetch signaled tasks, and forward current eligible discoveries; later reconcile and drain tasks sequentially |
-| `agent-handover run-once` | Validate and expose configuration; later reconcile and drain eligible tasks once |
+| `agent-handover run-once` | Query and authoritatively validate current Pending tasks once, then hand them to preparation sequentially |
 | `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
 | `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
 
@@ -308,6 +309,15 @@ An eligible task follows this lifecycle (later steps remain target behavior):
 One process lock protects each stable local state directory, and one task runs
 at a time. Local run records are the authority for automatic launch decisions;
 Notion status is an observable projection, not a distributed lock.
+
+`run-once` queries the configured task data source once, following bounded
+pagination, then refetches every candidate before accepting it. Candidates
+whose source, current Pending status, trash state, or observed revision no
+longer matches are ignored. The accepted set is ordered by authoritative
+`last_edited_time`, with page ID as a stable tie-breaker, and handed to the
+provider-neutral preparation boundary one task at a time. The command returns
+only after the complete cycle or a content-free actionable error. This step
+does not write task status or journal records and does not launch an executor.
 
 Each local prepared record is durably published with mode `0600` before later
 orchestration performs remote writes. The pre-launch orchestration boundary can
@@ -359,8 +369,8 @@ duplicate effects.
   Notion events are aggregated and delayed.
 - **A webhook changes nothing:** confirm the current page still has
   `Status = Pending`; stale and unrelated events are intentionally ignored.
-- **A task missed its webhook:** use `run-once` after that command is implemented
-  or wait for periodic reconciliation in `serve`.
+- **A task missed its webhook:** use `run-once`; periodic reconciliation in
+  `serve` remains planned.
 - **A task is `Error` after restart:** inspect its journal warning before
   choosing a manual retry; external effects may already have occurred.
 - **The runner refuses to start:** check private file permissions, the stable

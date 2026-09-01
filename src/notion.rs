@@ -15,6 +15,7 @@ const NOTION_API_ROOT: &str = "https://api.notion.com/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_NOTION_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_REVISION_BYTES: usize = 64;
+const MAX_CURSOR_BYTES: usize = 512;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskState {
@@ -29,6 +30,13 @@ pub struct TaskState {
 pub struct TaskRevision {
     value: String,
     instant: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingTaskPage {
+    pub tasks: Vec<TaskState>,
+    pub next_cursor: Option<String>,
+    pub response_bytes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,6 +66,14 @@ impl TaskRevision {
 }
 
 pub trait NotionAdapter: Send + Sync + 'static {
+    fn query_pending_tasks<'a>(
+        &'a self,
+        _cursor: Option<&'a str>,
+        _pending_status: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PendingTaskPage, String>> + Send + 'a>> {
+        Box::pin(async { Err("Notion Pending task queries are unavailable".to_owned()) })
+    }
+
     fn refetch_task<'a>(
         &'a self,
         page_id: &'a str,
@@ -96,6 +112,7 @@ pub struct NotionHttpClient {
     client: reqwest::Client,
     api_root: reqwest::Url,
     properties: TaskProperties,
+    task_data_source_id: String,
     journal_data_source_id: String,
     journal_properties: JournalProperties,
     journal_values: JournalValues,
@@ -155,6 +172,7 @@ impl NotionHttpClient {
             client,
             api_root,
             properties: properties.clone(),
+            task_data_source_id: config.task_data_source_id.clone(),
             journal_data_source_id: config.journal_data_source_id.clone(),
             journal_properties: journal_properties.clone(),
             journal_values: journal_values.clone(),
@@ -196,6 +214,57 @@ impl NotionHttpClient {
         let page = serde_json::from_slice::<Value>(&body)
             .map_err(|_| "Notion returned an invalid task response".to_owned())?;
         parse_task(page_id, &page, &self.properties)
+    }
+
+    async fn query_pending(
+        &self,
+        cursor: Option<&str>,
+        pending_status: &str,
+    ) -> Result<PendingTaskPage, String> {
+        let mut url = self.api_root.clone();
+        url.path_segments_mut()
+            .map_err(|_| "cannot initialize Notion API client".to_owned())?
+            .extend(["v1", "data_sources", &self.task_data_source_id, "query"]);
+        let mut body = serde_json::json!({
+            "page_size": 100,
+            "filter": {
+                "property": self.properties.status,
+                "status": { "equals": pending_status }
+            }
+        });
+        if let Some(cursor) = cursor {
+            body["start_cursor"] = Value::String(cursor.to_owned());
+        }
+        let mut response = self
+            .client
+            .post(url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| "cannot query Pending tasks from Notion".to_owned())?;
+        if !response.status().is_success() {
+            return Err("Notion refused the Pending task query".to_owned());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > self.max_response_bytes as u64)
+        {
+            return Err("Notion Pending task response exceeds the size limit".to_owned());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| "cannot read the Notion Pending task response".to_owned())?
+        {
+            if bytes.len().saturating_add(chunk.len()) > self.max_response_bytes {
+                return Err("Notion Pending task response exceeds the size limit".to_owned());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let value = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|_| "Notion returned an invalid Pending task response".to_owned())?;
+        parse_pending_task_page(&value, &self.properties, bytes.len())
     }
 
     async fn retrieve_block_page(
@@ -354,6 +423,14 @@ impl NotionHttpClient {
 }
 
 impl NotionAdapter for NotionHttpClient {
+    fn query_pending_tasks<'a>(
+        &'a self,
+        cursor: Option<&'a str>,
+        pending_status: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<PendingTaskPage, String>> + Send + 'a>> {
+        Box::pin(self.query_pending(cursor, pending_status))
+    }
+
     fn refetch_task<'a>(
         &'a self,
         page_id: &'a str,
@@ -507,7 +584,59 @@ fn parse_task(
         in_trash: page
             .get("in_trash")
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            .ok_or_else(|| "Notion returned an invalid task response".to_owned())?,
+    })
+}
+
+fn parse_pending_task_page(
+    value: &Value,
+    properties: &TaskProperties,
+    response_bytes: usize,
+) -> Result<PendingTaskPage, String> {
+    let invalid = || "Notion returned an invalid Pending task response".to_owned();
+    if value.get("object").and_then(Value::as_str) != Some("list")
+        || value.get("type").and_then(Value::as_str) != Some("page_or_data_source")
+    {
+        return Err(invalid());
+    }
+    let results = value
+        .get("results")
+        .and_then(Value::as_array)
+        .ok_or_else(&invalid)?;
+    if results.len() > 100 {
+        return Err(invalid());
+    }
+    let tasks = results
+        .iter()
+        .map(|page| {
+            let page_id = page
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(&invalid)?;
+            parse_task(page_id, page, properties).map_err(|_| invalid())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_more = value
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .ok_or_else(&invalid)?;
+    let next_cursor = match value.get("next_cursor") {
+        Some(Value::String(cursor))
+            if has_more
+                && !cursor.is_empty()
+                && cursor.len() <= MAX_CURSOR_BYTES
+                && cursor.is_ascii()
+                && !cursor.chars().any(char::is_control) =>
+        {
+            Some(cursor.clone())
+        }
+        Some(Value::Null) if !has_more => None,
+        _ => return Err(invalid()),
+    };
+    Ok(PendingTaskPage {
+        tasks,
+        next_cursor,
+        response_bytes,
     })
 }
 
@@ -669,6 +798,21 @@ mod tests {
         assert!(parse_task("page-placeholder", &page, &properties()).is_err());
     }
 
+    #[test]
+    fn requires_an_authoritative_boolean_trash_state() {
+        let mut page = serde_json::from_str::<Value>(&page_body("page-placeholder")).unwrap();
+        page.as_object_mut().unwrap().remove("in_trash");
+        assert_eq!(
+            parse_task("page-placeholder", &page, &properties()).unwrap_err(),
+            "Notion returned an invalid task response"
+        );
+        page["in_trash"] = Value::String("false".to_owned());
+        assert_eq!(
+            parse_task("page-placeholder", &page, &properties()).unwrap_err(),
+            "Notion returned an invalid task response"
+        );
+    }
+
     #[tokio::test]
     async fn production_client_encodes_path_and_sends_required_secret_headers() {
         let page_id = "page/with space";
@@ -723,6 +867,75 @@ mod tests {
         ));
         assert!(lower.contains("authorization: bearer secret-placeholder\r\n"));
         assert!(lower.contains("notion-version: 2026-03-11\r\n"));
+    }
+
+    #[tokio::test]
+    async fn pending_query_uses_configured_source_status_cursor_and_page_limit() {
+        let body = json!({
+            "object": "list",
+            "type": "page_or_data_source",
+            "results": [serde_json::from_str::<Value>(&page_body("page-placeholder")).unwrap()],
+            "has_more": true,
+            "next_cursor": "next-placeholder"
+        })
+        .to_string();
+        let (root, server) = fake_server(response("200 OK", &body), Duration::ZERO).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            &journal_properties(),
+            &journal_values(),
+            root,
+            Duration::from_secs(1),
+            4096,
+        )
+        .unwrap();
+
+        let page = client
+            .query_pending(Some("cursor-placeholder"), "Awaiting")
+            .await
+            .unwrap();
+
+        assert_eq!(page.tasks.len(), 1);
+        assert_eq!(page.next_cursor.as_deref(), Some("next-placeholder"));
+        let request = server.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("POST /v1/data_sources/source-placeholder/query HTTP/1.1\r\n")
+        );
+        assert_eq!(
+            request_json(&request),
+            json!({
+                "page_size": 100,
+                "start_cursor": "cursor-placeholder",
+                "filter": {
+                    "property": "Status field",
+                    "status": {"equals": "Awaiting"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn pending_query_page_requires_bounded_results_and_cursor() {
+        let valid = serde_json::from_str::<Value>(&page_body("page-placeholder")).unwrap();
+        let too_many = json!({
+            "object": "list",
+            "type": "page_or_data_source",
+            "results": vec![valid.clone(); 101],
+            "has_more": false,
+            "next_cursor": null
+        });
+        assert!(parse_pending_task_page(&too_many, &properties(), 1).is_err());
+
+        let oversized_cursor = json!({
+            "object": "list",
+            "type": "page_or_data_source",
+            "results": [valid],
+            "has_more": true,
+            "next_cursor": "x".repeat(MAX_CURSOR_BYTES + 1)
+        });
+        assert!(parse_pending_task_page(&oversized_cursor, &properties(), 1).is_err());
     }
 
     #[tokio::test]

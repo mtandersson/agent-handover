@@ -9,6 +9,7 @@ mod http;
 mod notion;
 #[allow(dead_code)]
 mod orchestration;
+mod reconciliation;
 #[allow(dead_code)]
 mod state;
 
@@ -39,30 +40,8 @@ fn usage() -> String {
     "usage: agent-handover [--version | serve | run-once | webhook-enroll [--rotate]]".to_owned()
 }
 
-fn command_response(
-    command: Command,
-    config: &config::Config,
-    paths: &config::HostPaths,
-) -> String {
-    let name = match command {
-        Command::Serve => "serve",
-        Command::RunOnce => "run-once",
-        Command::WebhookEnroll { .. } => "webhook-enroll",
-    };
-    format!(
-        "{name} configuration ready: state={}, codex={}, workdir={}, profile={}, sandbox={}, environment={}, timeout={}s, reconcile={}s, bind={}, webhook={}, health={}",
-        paths.state_directory.display(),
-        config.codex.executable.display(),
-        config.codex.working_directory.display(),
-        config.codex.profile,
-        config.codex.sandbox,
-        config.codex.permitted_environment.join(","),
-        config.codex.timeout_seconds,
-        config.runner.reconciliation_interval_seconds,
-        config.runner.bind_address,
-        config.runner.webhook_path,
-        config.runner.health_path,
-    )
+fn run_once_response(count: usize) -> String {
+    format!("run-once reconciled {count} Pending task(s)")
 }
 
 fn main() -> ExitCode {
@@ -95,7 +74,27 @@ fn main() -> ExitCode {
                         dispatcher,
                     )
                 }),
-                Command::RunOnce => Ok(command_response(command, &config, &paths)),
+                Command::RunOnce => notion::NotionHttpClient::new(
+                    &config.notion,
+                    &config.task_properties,
+                    &config.journal_properties,
+                    &config.journal_values,
+                )
+                .and_then(|notion| {
+                    let _runner_lock =
+                        state::AttemptStore::new(paths.state_directory.clone()).acquire()?;
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| "cannot initialize run-once runtime".to_owned())?;
+                    let count = runtime.block_on(reconciliation::reconcile_once(
+                        &notion,
+                        &reconciliation::PendingPreparationSink,
+                        &config.notion,
+                        &config.task_values,
+                    ))?;
+                    Ok(run_once_response(count))
+                }),
             })
         }),
         Ok(None) if args.iter().any(|arg| arg == "--version" || arg == "-V") => {
@@ -119,12 +118,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, command_response, parse_command, usage};
-    use crate::config::{
-        CodexConfig, Config, HostPaths, JournalProperties, JournalValues, NotionConfig,
-        RunnerConfig, SandboxPolicy, TaskProperties, TaskValues,
-    };
-    use std::path::PathBuf;
+    use super::{Command, parse_command, run_once_response, usage};
 
     #[test]
     fn reports_that_the_command_is_ready_without_arguments() {
@@ -162,58 +156,10 @@ mod tests {
     }
 
     #[test]
-    fn command_summary_exposes_operational_configuration_but_not_secrets() {
-        let config = Config {
-            notion: NotionConfig {
-                token: "secret-placeholder".to_owned(),
-                task_data_source_id: "task-placeholder".to_owned(),
-                journal_data_source_id: "journal-placeholder".to_owned(),
-            },
-            task_properties: TaskProperties {
-                title: "Name".to_owned(),
-                status: "Status".to_owned(),
-            },
-            task_values: TaskValues {
-                pending: "Pending".to_owned(),
-                running: "Running".to_owned(),
-                error: "Error".to_owned(),
-                done: "Done".to_owned(),
-            },
-            journal_properties: JournalProperties {
-                run_id: "Run ID".to_owned(),
-                task: "Task".to_owned(),
-                executor: "Executor".to_owned(),
-                started_at: "Started at".to_owned(),
-            },
-            journal_values: JournalValues {
-                executor: "Codex".to_owned(),
-            },
-            codex: CodexConfig {
-                executable: PathBuf::from("codex"),
-                working_directory: PathBuf::from("/srv/project-placeholder"),
-                profile: "runner-placeholder".to_owned(),
-                sandbox: SandboxPolicy::WorkspaceWrite,
-                permitted_environment: vec!["PATH".to_owned()],
-                timeout_seconds: 900,
-            },
-            runner: RunnerConfig {
-                reconciliation_interval_seconds: 60,
-                bind_address: "127.0.0.1:8080".to_owned(),
-                webhook_path: "/notion/webhook".to_owned(),
-                health_path: "/health".to_owned(),
-            },
-        };
-        let paths = HostPaths {
-            config_file: PathBuf::from("/config-placeholder/config.toml"),
-            state_directory: PathBuf::from("/state-placeholder"),
-        };
-
-        for command in [Command::Serve, Command::RunOnce] {
-            let summary = command_response(command, &config, &paths);
-            assert!(summary.contains("configuration ready"));
-            assert!(summary.contains("sandbox=workspace-write"));
-            assert!(!summary.contains("secret-placeholder"));
-            assert!(!summary.contains("task-placeholder"));
-        }
+    fn run_once_reports_only_the_completed_cycle_count() {
+        assert_eq!(
+            run_once_response(3),
+            "run-once reconciled 3 Pending task(s)"
+        );
     }
 }
