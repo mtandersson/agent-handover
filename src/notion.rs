@@ -97,9 +97,15 @@ impl NotionHttpClient {
             "notion-version",
             HeaderValue::from_static(NOTION_API_VERSION),
         );
+        let root_certificates = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|certificate| reqwest::Certificate::from_der(certificate.as_ref()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| "cannot initialize Notion API client".to_owned())?;
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .timeout(timeout)
+            .tls_certs_only(root_certificates)
             .build()
             .map_err(|_| "cannot initialize Notion API client".to_owned())?;
         Ok(Self {
