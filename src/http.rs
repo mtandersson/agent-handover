@@ -6,7 +6,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
