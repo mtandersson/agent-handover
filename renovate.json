@@ -5,5 +5,8 @@
     ":semanticCommits"
   ],
   "automerge": true,
-  "platformAutomerge": false
+  "platformAutomerge": false,
+  "ignorePaths": [
+    "release-tooling/**"
+  ]
 }
