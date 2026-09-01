@@ -1,37 +1,26 @@
 use crate::config::{NotionConfig, TaskValues};
+use crate::coordination::{PreparationSink, RevisionCoordinator};
 use crate::http::EventDispatcher;
-use crate::notion::{NotionAdapter, TaskRevision, TaskState};
+use crate::notion::{NotionAdapter, TaskState};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 
 const REMEMBERED_EVENT_IDS: usize = 4096;
-const REMEMBERED_PAGE_REVISIONS: usize = 4096;
 pub const MAX_DISPATCH_WORK: usize = 16;
 const MAX_EVENT_FIELD_BYTES: usize = 128;
 const MAX_TIMESTAMP_BYTES: usize = 64;
-
-pub trait DiscoverySink: Send + Sync + 'static {
-    fn task_discovered(&self, task: DiscoveredTask) -> Result<(), String>;
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredTask {
     pub state: TaskState,
     pub instructions: String,
-}
-
-pub struct PendingDiscoverySink;
-
-impl DiscoverySink for PendingDiscoverySink {
-    fn task_discovered(&self, _task: DiscoveredTask) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 type EventResult = Result<(), String>;
@@ -42,9 +31,6 @@ struct DeliveryState {
     handled_event_ids: HashSet<String>,
     handled_event_order: VecDeque<String>,
     in_flight_events: HashMap<String, CompletionSender>,
-    page_revisions: HashMap<String, TaskRevision>,
-    page_revision_order: VecDeque<String>,
-    page_gates: HashMap<String, Arc<PageGate>>,
 }
 
 impl DeliveryState {
@@ -58,24 +44,6 @@ impl DeliveryState {
             }
         }
     }
-
-    fn remember_revision(&mut self, page_id: String, revision: TaskRevision, limit: usize) {
-        if self.page_revisions.contains_key(&page_id) {
-            self.page_revision_order.retain(|entry| entry != &page_id);
-        }
-        self.page_revisions.insert(page_id.clone(), revision);
-        self.page_revision_order.push_back(page_id);
-        while self.page_revision_order.len() > limit {
-            if let Some(expired) = self.page_revision_order.pop_front() {
-                self.page_revisions.remove(&expired);
-            }
-        }
-    }
-}
-
-struct PageGate {
-    lock: Arc<Mutex<()>>,
-    users: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -99,23 +67,13 @@ impl AdmissionHook {
     }
 }
 
-impl PageGate {
-    fn new() -> Self {
-        Self {
-            lock: Arc::new(Mutex::new(())),
-            users: AtomicUsize::new(0),
-        }
-    }
-}
-
 struct DispatcherInner<A, S> {
     adapter: Arc<A>,
-    sink: Arc<S>,
+    coordinator: Arc<RevisionCoordinator<S>>,
     task_data_source_id: Arc<str>,
     pending: Arc<str>,
     delivery: Arc<Mutex<DeliveryState>>,
     event_limit: usize,
-    revision_limit: usize,
     work_permits: Arc<Semaphore>,
     #[cfg(test)]
     admission_hook: Option<Arc<AdmissionHook>>,
@@ -138,38 +96,49 @@ pub struct NotionEventDispatcher<A, S> {
 impl<A, S> NotionEventDispatcher<A, S>
 where
     A: NotionAdapter,
-    S: DiscoverySink,
+    S: PreparationSink,
 {
     pub fn new(adapter: A, sink: S, notion: &NotionConfig, values: &TaskValues) -> Self {
+        Self::with_coordinator(
+            adapter,
+            Arc::new(RevisionCoordinator::new(sink)),
+            notion,
+            values,
+        )
+    }
+
+    pub(crate) fn with_coordinator(
+        adapter: A,
+        coordinator: Arc<RevisionCoordinator<S>>,
+        notion: &NotionConfig,
+        values: &TaskValues,
+    ) -> Self {
         Self::with_limits(
             adapter,
-            sink,
+            coordinator,
             notion,
             values,
             REMEMBERED_EVENT_IDS,
-            REMEMBERED_PAGE_REVISIONS,
             MAX_DISPATCH_WORK,
         )
     }
 
     fn with_limits(
         adapter: A,
-        sink: S,
+        coordinator: Arc<RevisionCoordinator<S>>,
         notion: &NotionConfig,
         values: &TaskValues,
         event_limit: usize,
-        revision_limit: usize,
         work_limit: usize,
     ) -> Self {
         Self {
             inner: Arc::new(DispatcherInner {
                 adapter: Arc::new(adapter),
-                sink: Arc::new(sink),
+                coordinator,
                 task_data_source_id: Arc::from(notion.task_data_source_id.as_str()),
                 pending: Arc::from(values.pending.as_str()),
                 delivery: Arc::new(Mutex::new(DeliveryState::default())),
                 event_limit,
-                revision_limit,
                 work_permits: Arc::new(Semaphore::new(work_limit)),
                 #[cfg(test)]
                 admission_hook: None,
@@ -274,7 +243,7 @@ async fn wait_for_completion(completion: &mut watch::Receiver<Option<EventResult
 impl<A, S> DispatcherInner<A, S>
 where
     A: NotionAdapter,
-    S: DiscoverySink,
+    S: PreparationSink,
 {
     async fn run_event(self: Arc<Self>, event: WebhookEvent) -> EventResult {
         // Event timestamps are deliberately not watermarks. A unique event can
@@ -287,64 +256,18 @@ where
             return Ok(());
         }
 
-        let lease = self.acquire_page(&task.page_id).await;
-        let result = self.decide_and_discover(task).await;
-        lease.release().await;
-        result
+        self.decide_and_discover(task).await
     }
 
     async fn decide_and_discover(&self, task: TaskState) -> EventResult {
-        {
-            let delivery = self.delivery.lock().await;
-            if delivery
-                .page_revisions
-                .get(&task.page_id)
-                .is_some_and(|known| known.instant() >= task.revision.instant())
-            {
-                return Ok(());
-            }
-        }
-
         let instructions = self.adapter.render_task(&task.page_id).await?;
-        let sink = Arc::clone(&self.sink);
-        let sink_task = DiscoveredTask {
-            state: task.clone(),
-            instructions,
-        };
-        let result = tokio::task::spawn_blocking(move || sink.task_discovered(sink_task))
+        self.coordinator
+            .prepare(DiscoveredTask {
+                state: task,
+                instructions,
+            })
             .await
-            .map_err(|_| "discovery boundary stopped unexpectedly".to_owned())?;
-        if result.is_ok() {
-            let mut delivery = self.delivery.lock().await;
-            if !delivery
-                .page_revisions
-                .get(&task.page_id)
-                .is_some_and(|known| known.instant() >= task.revision.instant())
-            {
-                delivery.remember_revision(task.page_id, task.revision, self.revision_limit);
-            }
-        }
-        result
-    }
-
-    async fn acquire_page(&self, page_id: &str) -> PageLease {
-        let gate = {
-            let mut delivery = self.delivery.lock().await;
-            let gate = Arc::clone(
-                delivery
-                    .page_gates
-                    .entry(page_id.to_owned())
-                    .or_insert_with(|| Arc::new(PageGate::new())),
-            );
-            gate.users.fetch_add(1, Ordering::SeqCst);
-            gate
-        };
-        let guard = Arc::clone(&gate.lock).lock_owned().await;
-        PageLease {
-            delivery: Arc::clone(&self.delivery),
-            gate: Some(gate),
-            guard: Some(guard),
-        }
+            .map(|_| ())
     }
 
     async fn finish_event(&self, event_id: String, outcome: EventResult) {
@@ -358,51 +281,10 @@ where
     }
 }
 
-struct PageLease {
-    delivery: Arc<Mutex<DeliveryState>>,
-    gate: Option<Arc<PageGate>>,
-    guard: Option<OwnedMutexGuard<()>>,
-}
-
-impl PageLease {
-    async fn release(mut self) {
-        self.guard.take();
-        let gate = self.gate.take().expect("page lease owns its gate");
-        let mut delivery = self.delivery.lock().await;
-        release_page(&mut delivery, &gate);
-    }
-}
-
-impl Drop for PageLease {
-    fn drop(&mut self) {
-        self.guard.take();
-        let Some(gate) = self.gate.take() else {
-            return;
-        };
-        if let Ok(mut delivery) = self.delivery.try_lock() {
-            release_page(&mut delivery, &gate);
-            return;
-        }
-        let delivery = Arc::clone(&self.delivery);
-        tokio::spawn(async move {
-            let mut delivery = delivery.lock().await;
-            release_page(&mut delivery, &gate);
-        });
-    }
-}
-
-fn release_page(delivery: &mut DeliveryState, gate: &Arc<PageGate>) {
-    if gate.users.fetch_sub(1, Ordering::SeqCst) == 1 {
-        delivery
-            .page_gates
-            .retain(|_, known| !Arc::ptr_eq(known, gate));
-    }
-}
-
 impl<A, S> EventDispatcher for NotionEventDispatcher<A, S>
 where
     A: NotionAdapter,
-    S: DiscoverySink,
+    S: PreparationSink,
 {
     fn dispatch(&self, event: Value) -> Pin<Box<dyn Future<Output = EventResult> + Send + '_>> {
         Box::pin(self.process(event))
@@ -471,8 +353,9 @@ struct EventParent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::notion::TaskRevision;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
-    use std::sync::{Condvar, Mutex as StdMutex};
     use std::time::Duration;
     use tokio::sync::Semaphore;
 
@@ -507,10 +390,15 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink(StdMutex<Vec<DiscoveredTask>>);
 
-    impl DiscoverySink for RecordingSink {
-        fn task_discovered(&self, task: DiscoveredTask) -> EventResult {
-            self.0.lock().unwrap().push(task);
-            Ok(())
+    impl PreparationSink for RecordingSink {
+        fn prepare<'a>(
+            &'a self,
+            task: DiscoveredTask,
+        ) -> Pin<Box<dyn Future<Output = EventResult> + Send + 'a>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(task);
+                Ok(())
+            })
         }
     }
 
@@ -594,7 +482,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
-        let discovered = dispatcher.inner.sink.0.lock().unwrap();
+        let discovered = dispatcher.inner.coordinator.sink.0.lock().unwrap();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].instructions, "instructions for p");
     }
@@ -615,7 +503,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let revisions = dispatcher.inner.sink.0.lock().unwrap();
+        let revisions = dispatcher.inner.coordinator.sink.0.lock().unwrap();
         assert_eq!(revisions.len(), 2);
         assert!(revisions[0].state.revision.instant() < revisions[1].state.revision.instant());
     }
@@ -641,7 +529,7 @@ mod tests {
         );
         old.unwrap();
         new.unwrap();
-        let revisions = dispatcher.inner.sink.0.lock().unwrap();
+        let revisions = dispatcher.inner.coordinator.sink.0.lock().unwrap();
         assert_eq!(revisions.len(), 1);
         assert_eq!(
             revisions[0].state.revision.instant(),
@@ -654,19 +542,23 @@ mod tests {
     struct BlockingSink {
         calls: AtomicUsize,
         started: Semaphore,
-        released: (StdMutex<bool>, Condvar),
+        released: AtomicBool,
+        changed: tokio::sync::Notify,
     }
 
-    impl DiscoverySink for BlockingSink {
-        fn task_discovered(&self, _task: DiscoveredTask) -> EventResult {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.started.add_permits(1);
-            let (released, changed) = &self.released;
-            let mut released = released.lock().unwrap();
-            while !*released {
-                released = changed.wait(released).unwrap();
-            }
-            Ok(())
+    impl PreparationSink for BlockingSink {
+        fn prepare<'a>(
+            &'a self,
+            _task: DiscoveredTask,
+        ) -> Pin<Box<dyn Future<Output = EventResult> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.add_permits(1);
+                while !self.released.load(Ordering::SeqCst) {
+                    self.changed.notified().await;
+                }
+                Ok(())
+            })
         }
     }
 
@@ -683,7 +575,8 @@ mod tests {
             BlockingSink {
                 calls: AtomicUsize::new(0),
                 started: Semaphore::new(0),
-                released: (StdMutex::new(false), Condvar::new()),
+                released: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
             },
             &notion,
             &values,
@@ -695,6 +588,7 @@ mod tests {
             tokio::spawn(async move { original_dispatcher.dispatch(original_signal).await });
         dispatcher
             .inner
+            .coordinator
             .sink
             .started
             .acquire()
@@ -708,15 +602,35 @@ mod tests {
         let retry = tokio::spawn(async move { retry_dispatcher.dispatch(retry_signal).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(dispatcher.inner.sink.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            1
+        );
 
-        let (released, changed) = &dispatcher.inner.sink.released;
-        *released.lock().unwrap() = true;
-        changed.notify_all();
+        dispatcher
+            .inner
+            .coordinator
+            .sink
+            .released
+            .store(true, Ordering::SeqCst);
+        dispatcher.inner.coordinator.sink.changed.notify_waiters();
         retry.await.unwrap().unwrap();
         dispatcher.dispatch(signal).await.unwrap();
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(dispatcher.inner.sink.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            1
+        );
     }
 
     #[tokio::test]
@@ -760,11 +674,11 @@ mod tests {
         );
         dispatcher.dispatch(signal).await.unwrap();
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(dispatcher.inner.sink.0.lock().unwrap().len(), 1);
+        assert_eq!(dispatcher.inner.coordinator.sink.0.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
-    async fn caches_are_bounded_with_deterministic_revision_eviction() {
+    async fn event_cache_is_bounded_with_deterministic_eviction() {
         let (notion, values) = configuration();
         let dispatcher = NotionEventDispatcher::with_limits(
             FakeNotion {
@@ -773,10 +687,9 @@ mod tests {
                 }),
                 calls: AtomicUsize::new(0),
             },
-            RecordingSink::default(),
+            Arc::new(RevisionCoordinator::new(RecordingSink::default())),
             &notion,
             &values,
-            2,
             2,
             2,
         );
@@ -786,10 +699,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert_eq!(dispatcher.inner.sink.0.lock().unwrap().len(), 4);
+        assert_eq!(dispatcher.inner.coordinator.sink.0.lock().unwrap().len(), 3);
         let state = dispatcher.inner.delivery.lock().await;
-        assert_eq!(state.handled_event_ids.len(), 2);
-        assert_eq!(state.page_revisions.len(), 2);
+        assert_eq!(
+            state.handled_event_order,
+            VecDeque::from(["e3".to_owned(), "e4".to_owned()])
+        );
+        assert_eq!(
+            state.handled_event_ids,
+            HashSet::from(["e3".to_owned(), "e4".to_owned()])
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -802,14 +721,14 @@ mod tests {
                 }),
                 calls: AtomicUsize::new(0),
             },
-            BlockingSink {
+            Arc::new(RevisionCoordinator::new(BlockingSink {
                 calls: AtomicUsize::new(0),
                 started: Semaphore::new(0),
-                released: (StdMutex::new(false), Condvar::new()),
-            },
+                released: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
+            })),
             &notion,
             &values,
-            8,
             8,
             2,
         ));
@@ -824,6 +743,7 @@ mod tests {
         }
         dispatcher
             .inner
+            .coordinator
             .sink
             .started
             .acquire_many(2)
@@ -851,24 +771,26 @@ mod tests {
             let state = dispatcher.inner.delivery.lock().await;
             assert_eq!(state.in_flight_events.len(), 2);
             assert!(!state.in_flight_events.contains_key("c"));
-            assert_eq!(state.page_gates.len(), 2);
-            assert!(!state.page_gates.contains_key("page-c"));
-            assert_eq!(
-                state
-                    .page_gates
-                    .values()
-                    .map(|gate| gate.users.load(Ordering::SeqCst))
-                    .sum::<usize>(),
-                2
-            );
         }
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(dispatcher.inner.sink.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            2
+        );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 0);
 
-        let (released, changed) = &dispatcher.inner.sink.released;
-        *released.lock().unwrap() = true;
-        changed.notify_all();
+        dispatcher
+            .inner
+            .coordinator
+            .sink
+            .released
+            .store(true, Ordering::SeqCst);
+        dispatcher.inner.coordinator.sink.changed.notify_waiters();
         for owner in owners {
             owner.await.unwrap().unwrap();
         }
@@ -880,7 +802,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 3);
-        assert_eq!(dispatcher.inner.sink.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            3
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -893,14 +823,14 @@ mod tests {
                 }),
                 calls: AtomicUsize::new(0),
             },
-            BlockingSink {
+            Arc::new(RevisionCoordinator::new(BlockingSink {
                 calls: AtomicUsize::new(0),
                 started: Semaphore::new(0),
-                released: (StdMutex::new(false), Condvar::new()),
-            },
+                released: AtomicBool::new(false),
+                changed: tokio::sync::Notify::new(),
+            })),
             &notion,
             &values,
-            8,
             8,
             2,
         );
@@ -922,6 +852,7 @@ mod tests {
         }
         dispatcher
             .inner
+            .coordinator
             .sink
             .started
             .acquire()
@@ -937,7 +868,7 @@ mod tests {
         });
         tokio::time::timeout(
             Duration::from_secs(1),
-            dispatcher.inner.sink.started.acquire(),
+            dispatcher.inner.coordinator.sink.started.acquire(),
         )
         .await
         .expect("race loser must release admission for unrelated work")
@@ -945,7 +876,15 @@ mod tests {
         .forget();
 
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
-        assert_eq!(dispatcher.inner.sink.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            2
+        );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 0);
         assert_eq!(
             dispatcher
@@ -958,9 +897,13 @@ mod tests {
             2
         );
 
-        let (released, changed) = &dispatcher.inner.sink.released;
-        *released.lock().unwrap() = true;
-        changed.notify_all();
+        dispatcher
+            .inner
+            .coordinator
+            .sink
+            .released
+            .store(true, Ordering::SeqCst);
+        dispatcher.inner.coordinator.sink.changed.notify_waiters();
         for duplicate in duplicates {
             duplicate.await.unwrap().unwrap();
         }

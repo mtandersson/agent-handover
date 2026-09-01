@@ -33,7 +33,9 @@ retries are out of scope.
 Private local state now provides the process-lock and prepared-attempt
 foundation for later orchestration. `run-once` performs one reconciliation and
 sequentially hands the eligible observed set to the provider-neutral
-preparation boundary; `serve` is not wired to reconciliation yet.
+preparation boundary; `serve` is not wired to reconciliation yet. Webhook and
+reconciliation discoveries share a revision-aware coordination boundary when
+they run in the same process.
 
 ## Architecture
 
@@ -114,11 +116,16 @@ contract. Duplicate event
 IDs are acknowledged without another refetch; unique events
 are not rejected by timestamp because an older delivery can still reveal newer
 authoritative state. The runner parses `last_edited_time` as an RFC 3339 instant
-and serializes discovery decisions per page, so the same or an older revision
-never follows a newer cached revision to the discovery boundary. The bounded
-revision cache still recognizes a later manual `Error -> Pending` revision even
-when the intermediate non-Pending webhook was not observed. Runner-owned
-transitions to `Running`, `Done`, or `Error` are ignored as feedback signals.
+and routes webhook and reconciliation discoveries through one coordination
+boundary. Decisions for one page are serialized while unrelated pages may be
+accepted concurrently. A successfully prepared authoritative revision is the
+deduplication key regardless of its discovery source, so an equal or older
+revision cannot follow it to preparation. Failed handoffs do not advance the
+watermark and can be retried. The bounded cache deterministically evicts the
+least recently accepted page and still recognizes a later manual
+`Error -> Pending` revision even when the intermediate non-Pending state was
+not observed. Runner-owned transitions to `Running`, `Done`, or `Error` are
+ignored as feedback signals.
 
 For each eligible revision, the runner retrieves every page of
 [block children][notion-blocks] and traverses nested content depth-first in
@@ -315,9 +322,11 @@ pagination, then refetches every candidate before accepting it. Candidates
 whose source, current Pending status, trash state, or observed revision no
 longer matches are ignored. The accepted set is ordered by authoritative
 `last_edited_time`, with page ID as a stable tie-breaker, and handed to the
-provider-neutral preparation boundary one task at a time. The command returns
-only after the complete cycle or a content-free actionable error. This step
-does not write task status or journal records and does not launch an executor.
+shared provider-neutral revision coordinator one task at a time. A revision is
+remembered only after preparation accepts it, so a failed handoff remains
+retryable. The command returns only after the complete cycle or a content-free
+actionable error. This step does not write task status or journal records and
+does not launch an executor.
 
 Each local prepared record is durably published with mode `0600` before later
 orchestration performs remote writes. The pre-launch orchestration boundary can

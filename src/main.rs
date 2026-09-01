@@ -3,6 +3,7 @@ use std::io;
 use std::process::ExitCode;
 
 mod config;
+mod coordination;
 mod discovery;
 mod enrollment;
 mod http;
@@ -64,7 +65,7 @@ fn main() -> ExitCode {
                 .and_then(|notion| {
                     let dispatcher = discovery::NotionEventDispatcher::new(
                         notion,
-                        discovery::PendingDiscoverySink,
+                        coordination::PendingPreparationSink,
                         &config.notion,
                         &config.task_values,
                     );
@@ -89,7 +90,9 @@ fn main() -> ExitCode {
                         .map_err(|_| "cannot initialize run-once runtime".to_owned())?;
                     let count = runtime.block_on(reconciliation::reconcile_once(
                         &notion,
-                        &reconciliation::PendingPreparationSink,
+                        &coordination::RevisionCoordinator::new(
+                            coordination::PendingPreparationSink,
+                        ),
                         &config.notion,
                         &config.task_values,
                     ))?;
