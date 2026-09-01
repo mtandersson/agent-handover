@@ -1,3 +1,37 @@
+## [0.8.0](https://github.com/mtandersson/agent-handover/compare/v0.7.0...v0.8.0) (2026-09-01)
+
+### Features
+
+* coordinate discovered task revisions ([010fd8a](https://github.com/mtandersson/agent-handover/commit/010fd8ac296ba6175045adf74310602099969e61))
+* prepare visible Notion attempts ([6738620](https://github.com/mtandersson/agent-handover/commit/67386208e5c4cbb89b9435dab19f0c254e283b9b))
+* reconcile pending tasks during serve ([da84b68](https://github.com/mtandersson/agent-handover/commit/da84b685b6f31a7749196deb3d1900fedff39745))
+* reconcile Pending tasks with run-once ([63b3834](https://github.com/mtandersson/agent-handover/commit/63b383439a04a4a12670561b807648f2c1be990b))
+* **state:** persist exclusive prepared attempts ([63be5a3](https://github.com/mtandersson/agent-handover/commit/63be5a384cb931fc4187831260661cf7d9579e01))
+
+### Bug Fixes
+
+* **build:** refresh release tooling dependency hash ([f206d53](https://github.com/mtandersson/agent-handover/commit/f206d532c6ec12ac29950b4a6e33c555c23dee3e))
+* **deps:** align sha2 with hmac 0.13 ([1f95e55](https://github.com/mtandersson/agent-handover/commit/1f95e55087235d5bdf1c9701d3350a04545a5005))
+* **deps:** exclude Nix-pinned npm tooling from Renovate ([d25cfe1](https://github.com/mtandersson/agent-handover/commit/d25cfe1b52ca2065c8a3104b3a50a83fd3b3a48a))
+* **deps:** migrate reqwest rustls configuration ([1f2fa0c](https://github.com/mtandersson/agent-handover/commit/1f2fa0c7ccec7484d81fa7d0f496032b3c0998bf))
+* **deps:** update dependency conventional-changelog-conventionalcommits to v9.3.1 ([53dba19](https://github.com/mtandersson/agent-handover/commit/53dba19e39b7c5df3223e4eb885d18908f467b64))
+* **deps:** update rust crate hmac to 0.13 ([e27a704](https://github.com/mtandersson/agent-handover/commit/e27a70493fbd99c5fcfd4b6780b8fda2b2a34b56))
+* **deps:** update rust crate reqwest to 0.13 ([d851fe3](https://github.com/mtandersson/agent-handover/commit/d851fe3c42faac96886395f3a7c92faceaa1c913))
+* **deps:** update rust crate toml to v1 ([0b5c61a](https://github.com/mtandersson/agent-handover/commit/0b5c61ad31f067b456be3feb9eb1a5d469a0c7dd))
+
+### Performance Improvements
+
+* **ci:** cache reusable Nix build artifacts ([3939ea8](https://github.com/mtandersson/agent-handover/commit/3939ea81e2da94eea9cb9c6791404d6e7bb4922d))
+
+### Tests
+
+* **ci:** allow process startup before timeout assertion ([6715d72](https://github.com/mtandersson/agent-handover/commit/6715d72c9c5c315e7f1fa0e0610975b29fef649c))
+
+### Continuous Integration
+
+* automerge Renovate updates after checks pass ([ebe6139](https://github.com/mtandersson/agent-handover/commit/ebe61399a437fac687fca62fb3aa8379835a3c55))
+* schedule weekly releases ([1484974](https://github.com/mtandersson/agent-handover/commit/14849749a0d1f544c459245cf37d3b5f2897b39f))
+
 ## [0.7.0](https://github.com/mtandersson/agent-handover/compare/v0.6.2...v0.7.0) (2026-08-31)
 
 ### Features
