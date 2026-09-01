@@ -24,6 +24,8 @@ The project is currently a minimal Rust CLI:
 - `src/enrollment.rs`: fakeable webhook-token enrollment and private file storage.
 - `src/http.rs`: loopback HTTP serving, webhook authentication, and async dispatch boundary.
 - `src/notion.rs`: fakeable Notion task refetch adapter and production HTTP client.
+- `src/orchestration.rs`: provider-neutral pre-launch preparation and Notion
+  visibility gate.
 - `src/state.rs`: private process locking and durable prepared-attempt storage.
 - `flake.nix` and `Cargo.toml`: reproducible toolchain, checks, and package
   metadata.

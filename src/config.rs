@@ -24,6 +24,8 @@ pub struct Config {
     pub notion: NotionConfig,
     pub task_properties: TaskProperties,
     pub task_values: TaskValues,
+    pub journal_properties: JournalProperties,
+    pub journal_values: JournalValues,
     pub codex: CodexConfig,
     pub runner: RunnerConfig,
 }
@@ -34,6 +36,8 @@ struct FileConfig {
     notion: FileNotionConfig,
     task_properties: TaskProperties,
     task_values: TaskValues,
+    journal_properties: JournalProperties,
+    journal_values: JournalValues,
     codex: CodexConfig,
     runner: RunnerConfig,
 }
@@ -266,6 +270,8 @@ impl fmt::Debug for Config {
             .field("notion", &self.notion)
             .field("task_properties", &self.task_properties)
             .field("task_values", &self.task_values)
+            .field("journal_properties", &self.journal_properties)
+            .field("journal_values", &self.journal_values)
             .field("codex", &self.codex)
             .field("runner", &self.runner)
             .finish()
@@ -286,6 +292,21 @@ pub struct TaskValues {
     pub running: String,
     pub error: String,
     pub done: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JournalProperties {
+    pub run_id: String,
+    pub task: String,
+    pub executor: String,
+    pub started_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct JournalValues {
+    pub executor: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -426,6 +447,8 @@ fn load_with_resolver(
         },
         task_properties: file_config.task_properties,
         task_values: file_config.task_values,
+        journal_properties: file_config.journal_properties,
+        journal_values: file_config.journal_values,
         codex: file_config.codex,
         runner: file_config.runner,
     };
@@ -543,6 +566,26 @@ fn validate(config: &Config) -> Result<(), String> {
             config.task_properties.status.as_str(),
         ),
         ("codex.profile", config.codex.profile.as_str()),
+        (
+            "journal_properties.run_id",
+            config.journal_properties.run_id.as_str(),
+        ),
+        (
+            "journal_properties.task",
+            config.journal_properties.task.as_str(),
+        ),
+        (
+            "journal_properties.executor",
+            config.journal_properties.executor.as_str(),
+        ),
+        (
+            "journal_properties.started_at",
+            config.journal_properties.started_at.as_str(),
+        ),
+        (
+            "journal_values.executor",
+            config.journal_values.executor.as_str(),
+        ),
     ] {
         if value.trim().is_empty() {
             return Err(format!("configuration field {name} must not be empty"));
@@ -555,6 +598,21 @@ fn validate(config: &Config) -> Result<(), String> {
     ];
     if property_names.into_iter().collect::<HashSet<_>>().len() != property_names.len() {
         return Err("task title and status property names must be distinct".to_owned());
+    }
+
+    let journal_property_names = [
+        config.journal_properties.run_id.as_str(),
+        config.journal_properties.task.as_str(),
+        config.journal_properties.executor.as_str(),
+        config.journal_properties.started_at.as_str(),
+    ];
+    if journal_property_names
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .len()
+        != journal_property_names.len()
+    {
+        return Err("journal property names must be distinct".to_owned());
     }
 
     let statuses = [
@@ -690,6 +748,15 @@ pending = "Pending"
 running = "Running"
 error = "Error"
 done = "Done"
+
+[journal_properties]
+run_id = "Run ID"
+task = "Task"
+executor = "Executor"
+started_at = "Started at"
+
+[journal_values]
+executor = "Codex"
 
 [codex]
 executable = "codex"

@@ -202,6 +202,15 @@ running = "Running"
 error = "Error"
 done = "Done"
 
+[journal_properties]
+run_id = "Run ID"
+task = "Task"
+executor = "Executor"
+started_at = "Started at"
+
+[journal_values]
+executor = "Codex"
+
 [codex]
 executable = "codex"
 working_directory = "/absolute/path/to/project"
@@ -285,7 +294,7 @@ printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
 
 ## Task lifecycle and safety
 
-An eligible task follows this target lifecycle:
+An eligible task follows this lifecycle (later steps remain target behavior):
 
 1. Discovery confirms `Status = Pending` from current Notion state; the private
    host profile supplies Codex as the executor.
@@ -301,7 +310,12 @@ at a time. Local run records are the authority for automatic launch decisions;
 Notion status is an observable projection, not a distributed lock.
 
 Each local prepared record is durably published with mode `0600` before later
-orchestration performs remote writes. It contains only an immutable random run
+orchestration performs remote writes. The pre-launch orchestration boundary can
+now update and read back `Running`, create the initial journal record, and query
+its immutable run ID. An ambiguous creation response is resolved by that query
+without a second create, and no launch-ready value is exposed until both remote
+records match. This boundary is not yet wired into discovery or an executor.
+The local record contains only an immutable random run
 ID, an opaque task key, and the prepared state; task instructions, executor
 output, secrets, and host paths are excluded. The non-blocking process lock
 rejects a second owner for the same state directory and is released when its
