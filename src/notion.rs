@@ -108,6 +108,7 @@ pub trait NotionAdapter: Send + Sync + 'static {
     }
 }
 
+#[derive(Clone)]
 pub struct NotionHttpClient {
     client: reqwest::Client,
     api_root: reqwest::Url,

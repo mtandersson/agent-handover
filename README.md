@@ -7,11 +7,12 @@ and durable launch state on one private host.
 
 The repository contains the Rust CLI, private host configuration foundation,
 webhook-token enrollment, authenticated webhook HTTP intake, authoritative
-Notion task refetching, deterministic task-body rendering, and build and
-release tooling. `serve` exposes the configured health and webhook routes and
-forwards only currently eligible tasks, with their rendered instruction
-documents, to the orchestration boundary; it does not enqueue or launch Codex
-yet. Follow the [roadmap](#roadmap) for the remaining implementation sequence.
+Notion task refetching, deterministic task-body rendering, reconciliation, and
+build and release tooling. `serve` reconciles Pending tasks at startup and at
+the configured interval while continuing to accept health checks and webhook
+signals. Both discovery sources share revision-aware sequential preparation;
+the preparation sink does not enqueue or launch Codex yet. Follow the
+[roadmap](#roadmap) for the remaining implementation sequence.
 
 ## Intended capabilities
 
@@ -31,11 +32,10 @@ adapter, multiple host profiles, concurrent execution, and automatic agent
 retries are out of scope.
 
 Private local state now provides the process-lock and prepared-attempt
-foundation for later orchestration. `run-once` performs one reconciliation and
-sequentially hands the eligible observed set to the provider-neutral
-preparation boundary; `serve` is not wired to reconciliation yet. Webhook and
-reconciliation discoveries share a revision-aware coordination boundary when
-they run in the same process.
+foundation for later orchestration. `run-once` performs one reconciliation;
+`serve` performs one before HTTP intake begins and repeats it at the configured
+interval. Webhook and reconciliation discoveries share a revision-aware,
+provider-neutral, sequential preparation boundary.
 
 ## Architecture
 
@@ -65,9 +65,10 @@ nix develop --command cargo test
 
 The operator flow is to configure and share the Notion data sources, enroll a
 connection webhook, expose only that route through Cloudflare Tunnel, and start
-`agent-handover serve`. The server answers health checks and authenticates
-webhook JSON; Notion reconciliation and execution become active as later
-roadmap tickets land.
+`agent-handover serve`. Before accepting HTTP requests, the server completes
+one authoritative reconciliation. It then authenticates webhook JSON and
+repeats reconciliation at the configured interval without pausing health or
+webhook intake. Executor launch remains a later roadmap step.
 
 ## Notion setup
 
@@ -276,7 +277,7 @@ The runner interface is:
 
 | Command | Target behavior |
 | --- | --- |
-| `agent-handover serve` | Serve the health and webhook routes, authenticate events, refetch signaled tasks, and forward current eligible discoveries; later reconcile and drain tasks sequentially |
+| `agent-handover serve` | Reconcile Pending tasks at startup, then serve health and authenticated webhook routes while repeating reconciliation at the configured interval; all eligible discoveries enter preparation sequentially |
 | `agent-handover run-once` | Query and authoritatively validate current Pending tasks once, then hand them to preparation sequentially |
 | `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
 | `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
@@ -328,6 +329,16 @@ retryable. The command returns only after the complete cycle or a content-free
 actionable error. This step does not write task status or journal records and
 does not launch an executor.
 
+`serve` performs the same authoritative reconciliation before its HTTP accept
+loop is considered started. It then repeats the cycle every
+`runner.reconciliation_interval_seconds` while health checks and authenticated
+webhook signals remain active. Scheduled and webhook discoveries share one
+revision coordinator and one sequential preparation boundary, so the same or
+an older revision is not prepared twice across sources. A failed periodic
+cycle emits a content-free diagnostic and the next configured cycle still
+runs. Clean shutdown stops HTTP intake and waits for an active reconciliation
+and preparation handoff to finish; it does not abandon that work midway.
+
 Each local prepared record is durably published with mode `0600` before later
 orchestration performs remote writes. The pre-launch orchestration boundary can
 now update and read back `Running`, create the initial journal record, and query
@@ -378,8 +389,8 @@ duplicate effects.
   Notion events are aggregated and delayed.
 - **A webhook changes nothing:** confirm the current page still has
   `Status = Pending`; stale and unrelated events are intentionally ignored.
-- **A task missed its webhook:** use `run-once`; periodic reconciliation in
-  `serve` remains planned.
+- **A task missed its webhook:** wait for the next periodic reconciliation in
+  `serve`, restart `serve` to run startup reconciliation, or use `run-once`.
 - **A task is `Error` after restart:** inspect its journal warning before
   choosing a manual retry; external effects may already have occurred.
 - **The runner refuses to start:** check private file permissions, the stable
