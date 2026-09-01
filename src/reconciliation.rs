@@ -1,35 +1,16 @@
 use crate::config::{NotionConfig, TaskValues};
+use crate::coordination::{PreparationSink, RevisionCoordinator};
 use crate::discovery::DiscoveredTask;
 use crate::notion::{NotionAdapter, TaskState};
 use std::collections::HashSet;
-use std::future::Future;
-use std::pin::Pin;
 
 const MAX_QUERY_PAGES: usize = 10_000;
 const MAX_QUERY_TASKS: usize = 10_000;
 const MAX_QUERY_BYTES: usize = 16 * 1024 * 1024;
 
-pub(crate) trait PreparationSink: Send + Sync {
-    fn prepare<'a>(
-        &'a self,
-        task: DiscoveredTask,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
-pub(crate) struct PendingPreparationSink;
-
-impl PreparationSink for PendingPreparationSink {
-    fn prepare<'a>(
-        &'a self,
-        _task: DiscoveredTask,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async { Ok(()) })
-    }
-}
-
 pub(crate) async fn reconcile_once<N: NotionAdapter, S: PreparationSink>(
     notion: &N,
-    sink: &S,
+    coordinator: &RevisionCoordinator<S>,
     notion_config: &NotionConfig,
     task_values: &TaskValues,
 ) -> Result<usize, String> {
@@ -87,14 +68,18 @@ pub(crate) async fn reconcile_once<N: NotionAdapter, S: PreparationSink>(
             .then_with(|| left.page_id.cmp(&right.page_id))
     });
 
-    let count = eligible.len();
+    let mut count = 0;
     for state in eligible {
         let instructions = notion.render_task(&state.page_id).await?;
-        sink.prepare(DiscoveredTask {
-            state,
-            instructions,
-        })
-        .await?;
+        if coordinator
+            .prepare(DiscoveredTask {
+                state,
+                instructions,
+            })
+            .await?
+        {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -112,8 +97,12 @@ fn eligible_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::NotionEventDispatcher;
+    use crate::http::EventDispatcher;
     use crate::notion::{PendingTaskPage, TaskRevision};
     use std::collections::{HashMap, VecDeque};
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -252,7 +241,7 @@ mod tests {
             ],
             vec![early_a, early_b, late],
         );
-        let preparation = RecordingPreparation::default();
+        let preparation = RevisionCoordinator::new(RecordingPreparation::default());
         let (notion_config, task_values) = config();
 
         assert_eq!(
@@ -266,10 +255,10 @@ mod tests {
             vec![None, Some("next-placeholder".to_owned())]
         );
         assert_eq!(
-            *preparation.page_ids.lock().unwrap(),
+            *preparation.sink.page_ids.lock().unwrap(),
             vec!["page-a", "page-b", "page-c"]
         );
-        assert_eq!(preparation.peak.load(Ordering::SeqCst), 1);
+        assert_eq!(preparation.sink.peak.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -301,7 +290,7 @@ mod tests {
                 stale_current,
             ],
         );
-        let preparation = RecordingPreparation::default();
+        let preparation = RevisionCoordinator::new(RecordingPreparation::default());
         let (notion_config, task_values) = config();
 
         assert_eq!(
@@ -310,13 +299,82 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(*preparation.page_ids.lock().unwrap(), vec!["valid"]);
+        assert_eq!(*preparation.sink.page_ids.lock().unwrap(), vec!["valid"]);
+    }
+
+    #[tokio::test]
+    async fn concurrent_webhook_and_reconciliation_prepare_one_authoritative_revision() {
+        let candidate = task("page-a", "2026-01-01T00:00:00Z");
+        let notion = FakeNotion::new(vec![page(vec![candidate.clone()], None)], vec![candidate]);
+        let coordinator = Arc::new(RevisionCoordinator::new(RecordingPreparation::default()));
+        let (notion_config, task_values) = config();
+        let dispatcher = NotionEventDispatcher::with_coordinator(
+            notion.clone(),
+            Arc::clone(&coordinator),
+            &notion_config,
+            &task_values,
+        );
+        let signal = serde_json::json!({
+            "id": "event-placeholder",
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "page.properties_updated",
+            "entity": {"id": "page-a", "type": "page"},
+            "data": {
+                "parent": {
+                    "type": "database",
+                    "data_source_id": "task-source-placeholder"
+                }
+            }
+        });
+
+        let (webhook, reconciled) = tokio::join!(
+            dispatcher.dispatch(signal),
+            reconcile_once(&notion, &coordinator, &notion_config, &task_values),
+        );
+
+        webhook.unwrap();
+        assert!(reconciled.unwrap() <= 1);
+        assert_eq!(
+            coordinator.sink.page_ids.lock().unwrap().as_slice(),
+            ["page-a"]
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_reconciliation_results_prepare_one_authoritative_revision() {
+        let candidate = task("page-a", "2026-01-01T00:00:00Z");
+        let notion = FakeNotion::new(
+            vec![
+                page(vec![candidate.clone()], None),
+                page(vec![candidate.clone()], None),
+            ],
+            vec![candidate],
+        );
+        let coordinator = RevisionCoordinator::new(RecordingPreparation::default());
+        let (notion_config, task_values) = config();
+
+        assert_eq!(
+            reconcile_once(&notion, &coordinator, &notion_config, &task_values)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            reconcile_once(&notion, &coordinator, &notion_config, &task_values)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            coordinator.sink.page_ids.lock().unwrap().as_slice(),
+            ["page-a"]
+        );
     }
 
     #[tokio::test]
     async fn rejects_query_cursor_cycles_and_total_response_overflow() {
         let (notion_config, task_values) = config();
-        let preparation = RecordingPreparation::default();
+        let preparation = RevisionCoordinator::new(RecordingPreparation::default());
         let cycle = FakeNotion::new(
             vec![
                 page(Vec::new(), Some("repeat")),
@@ -350,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn enforces_task_and_page_limits_at_their_exact_boundaries() {
         let (notion_config, task_values) = config();
-        let preparation = PendingPreparationSink;
+        let preparation = RevisionCoordinator::new(crate::coordination::PendingPreparationSink);
 
         let mut boundary_tasks = Vec::with_capacity(MAX_QUERY_TASKS);
         for index in 0..MAX_QUERY_TASKS {
@@ -416,9 +474,14 @@ mod tests {
         let (notion_config, task_values) = config();
 
         assert_eq!(
-            reconcile_once(&notion, &FailingPreparation, &notion_config, &task_values)
-                .await
-                .unwrap_err(),
+            reconcile_once(
+                &notion,
+                &RevisionCoordinator::new(FailingPreparation),
+                &notion_config,
+                &task_values,
+            )
+            .await
+            .unwrap_err(),
             "cannot prepare discovered task"
         );
     }
