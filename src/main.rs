@@ -6,6 +6,8 @@ mod config;
 mod coordination;
 mod discovery;
 mod enrollment;
+#[allow(dead_code)]
+mod executor;
 mod http;
 mod notion;
 #[allow(dead_code)]
