@@ -8,6 +8,8 @@ mod enrollment;
 mod http;
 mod notion;
 #[allow(dead_code)]
+mod orchestration;
+#[allow(dead_code)]
 mod state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,23 +76,25 @@ fn main() -> ExitCode {
                     &enrollment::FileTokenStore::new(paths.state_directory),
                     rotate,
                 ),
-                Command::Serve => {
-                    notion::NotionHttpClient::new(&config.notion, &config.task_properties).and_then(
-                        |notion| {
-                            let dispatcher = discovery::NotionEventDispatcher::new(
-                                notion,
-                                discovery::PendingDiscoverySink,
-                                &config.notion,
-                                &config.task_values,
-                            );
-                            http::serve(
-                                &config.runner,
-                                &enrollment::FileTokenStore::new(paths.state_directory),
-                                dispatcher,
-                            )
-                        },
+                Command::Serve => notion::NotionHttpClient::new(
+                    &config.notion,
+                    &config.task_properties,
+                    &config.journal_properties,
+                    &config.journal_values,
+                )
+                .and_then(|notion| {
+                    let dispatcher = discovery::NotionEventDispatcher::new(
+                        notion,
+                        discovery::PendingDiscoverySink,
+                        &config.notion,
+                        &config.task_values,
+                    );
+                    http::serve(
+                        &config.runner,
+                        &enrollment::FileTokenStore::new(paths.state_directory),
+                        dispatcher,
                     )
-                }
+                }),
                 Command::RunOnce => Ok(command_response(command, &config, &paths)),
             })
         }),
@@ -117,8 +121,8 @@ fn main() -> ExitCode {
 mod tests {
     use super::{Command, command_response, parse_command, usage};
     use crate::config::{
-        CodexConfig, Config, HostPaths, NotionConfig, RunnerConfig, SandboxPolicy, TaskProperties,
-        TaskValues,
+        CodexConfig, Config, HostPaths, JournalProperties, JournalValues, NotionConfig,
+        RunnerConfig, SandboxPolicy, TaskProperties, TaskValues,
     };
     use std::path::PathBuf;
 
@@ -174,6 +178,15 @@ mod tests {
                 running: "Running".to_owned(),
                 error: "Error".to_owned(),
                 done: "Done".to_owned(),
+            },
+            journal_properties: JournalProperties {
+                run_id: "Run ID".to_owned(),
+                task: "Task".to_owned(),
+                executor: "Executor".to_owned(),
+                started_at: "Started at".to_owned(),
+            },
+            journal_values: JournalValues {
+                executor: "Codex".to_owned(),
             },
             codex: CodexConfig {
                 executable: PathBuf::from("codex"),
