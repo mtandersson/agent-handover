@@ -66,6 +66,7 @@ impl PageGate {
 pub(crate) struct RevisionCoordinator<S> {
     pub(crate) sink: Arc<S>,
     state: Arc<Mutex<CoordinationState>>,
+    preparation: Arc<Mutex<()>>,
     revision_limit: usize,
 }
 
@@ -81,6 +82,7 @@ where
         Self {
             sink: Arc::new(sink),
             state: Arc::new(Mutex::new(CoordinationState::default())),
+            preparation: Arc::new(Mutex::new(())),
             revision_limit,
         }
     }
@@ -93,6 +95,7 @@ where
     }
 
     async fn prepare_serialized(&self, task: DiscoveredTask) -> Result<bool, String> {
+        let _preparation = self.preparation.lock().await;
         {
             let state = self.state.lock().await;
             if state
@@ -286,7 +289,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_page_is_serialized_while_unrelated_pages_can_prepare_together() {
+    async fn preparation_is_sequential_across_unrelated_pages() {
         let coordinator = Arc::new(RevisionCoordinator::new(RecordingPreparation::default()));
         let (older, newer, unrelated) = tokio::join!(
             coordinator.prepare(task("page-a", "2026-01-01T00:00:00Z")),
@@ -297,7 +300,7 @@ mod tests {
         newer.unwrap();
         unrelated.unwrap();
         assert_eq!(coordinator.sink.accepted.lock().unwrap().len(), 3);
-        assert_eq!(coordinator.sink.peak.load(Ordering::SeqCst), 2);
+        assert_eq!(coordinator.sink.peak.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

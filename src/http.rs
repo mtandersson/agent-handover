@@ -1,5 +1,4 @@
 use crate::config::RunnerConfig;
-use crate::enrollment::TokenSource;
 use axum::Router;
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
@@ -14,6 +13,7 @@ use serde_json::Value;
 use sha2::Sha256;
 use std::error::Error;
 use std::future::Future;
+#[cfg(test)]
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -94,34 +94,25 @@ struct HttpRequest<'a> {
     body: &'a [u8],
 }
 
-pub fn serve<T: TokenSource, D: EventDispatcher>(
+pub(crate) async fn run<D, F>(
+    listener: TcpListener,
     config: &RunnerConfig,
-    token_source: &T,
+    token: Vec<u8>,
     dispatcher: D,
-) -> Result<String, String> {
-    let token = token_source.load()?;
-    let address = config
-        .bind_address
-        .parse::<SocketAddr>()
-        .map_err(|_| "configured HTTP bind address is invalid".to_owned())?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("cannot start HTTP runtime: {error}"))?;
-    runtime.block_on(async {
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|error| format!("cannot bind HTTP server: {error}"))?;
-        run_server(
-            listener,
-            state(config, token.into_bytes(), dispatcher),
-            std::future::pending::<()>(),
-            CONNECTION_DEADLINE,
-            Arc::new(AdmissionMetrics::default()),
-        )
-        .await
-    })?;
-    Ok("HTTP server stopped".to_owned())
+    shutdown: F,
+) -> Result<(), String>
+where
+    D: EventDispatcher,
+    F: Future<Output = ()> + Send + 'static,
+{
+    run_server(
+        listener,
+        state(config, token, dispatcher),
+        shutdown,
+        CONNECTION_DEADLINE,
+        Arc::new(AdmissionMetrics::default()),
+    )
+    .await
 }
 
 fn state<D: EventDispatcher>(config: &RunnerConfig, token: Vec<u8>, dispatcher: D) -> HttpState<D> {

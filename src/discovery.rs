@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::{Mutex, Semaphore, watch};
+use tokio::sync::{Mutex, Notify, Semaphore, watch};
 
 const REMEMBERED_EVENT_IDS: usize = 4096;
 pub const MAX_DISPATCH_WORK: usize = 16;
@@ -75,6 +75,7 @@ struct DispatcherInner<A, S> {
     delivery: Arc<Mutex<DeliveryState>>,
     event_limit: usize,
     work_permits: Arc<Semaphore>,
+    idle: Notify,
     #[cfg(test)]
     admission_hook: Option<Arc<AdmissionHook>>,
 }
@@ -93,20 +94,19 @@ pub struct NotionEventDispatcher<A, S> {
     inner: Arc<DispatcherInner<A, S>>,
 }
 
+impl<A, S> Clone for NotionEventDispatcher<A, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl<A, S> NotionEventDispatcher<A, S>
 where
     A: NotionAdapter,
     S: PreparationSink,
 {
-    pub fn new(adapter: A, sink: S, notion: &NotionConfig, values: &TaskValues) -> Self {
-        Self::with_coordinator(
-            adapter,
-            Arc::new(RevisionCoordinator::new(sink)),
-            notion,
-            values,
-        )
-    }
-
     pub(crate) fn with_coordinator(
         adapter: A,
         coordinator: Arc<RevisionCoordinator<S>>,
@@ -140,6 +140,7 @@ where
                 delivery: Arc::new(Mutex::new(DeliveryState::default())),
                 event_limit,
                 work_permits: Arc::new(Semaphore::new(work_limit)),
+                idle: Notify::new(),
                 #[cfg(test)]
                 admission_hook: None,
             }),
@@ -226,6 +227,16 @@ where
             }
         }
     }
+
+    pub(crate) async fn wait_for_idle(&self) {
+        loop {
+            let idle = self.inner.idle.notified();
+            if self.inner.delivery.lock().await.in_flight_events.is_empty() {
+                return;
+            }
+            idle.await;
+        }
+    }
 }
 
 async fn wait_for_completion(completion: &mut watch::Receiver<Option<EventResult>>) -> EventResult {
@@ -277,6 +288,9 @@ where
         }
         if let Some(completion) = delivery.in_flight_events.remove(&event_id) {
             let _ = completion.send(Some(outcome));
+        }
+        if delivery.in_flight_events.is_empty() {
+            self.idle.notify_waiters();
         }
     }
 }
@@ -446,12 +460,12 @@ mod tests {
         response: impl Fn(&str, usize) -> (Result<TaskState, String>, Duration) + Send + Sync + 'static,
     ) -> NotionEventDispatcher<FakeNotion, RecordingSink> {
         let (notion, values) = configuration();
-        NotionEventDispatcher::new(
+        NotionEventDispatcher::with_coordinator(
             FakeNotion {
                 response: Arc::new(response),
                 calls: AtomicUsize::new(0),
             },
-            RecordingSink::default(),
+            Arc::new(RevisionCoordinator::new(RecordingSink::default())),
             &notion,
             &values,
         )
@@ -565,19 +579,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn canceled_waiter_does_not_cancel_owned_event_work() {
         let (notion, values) = configuration();
-        let dispatcher = Arc::new(NotionEventDispatcher::new(
+        let dispatcher = Arc::new(NotionEventDispatcher::with_coordinator(
             FakeNotion {
                 response: Arc::new(|page, _| {
                     (Ok(eligible(page, "2026-01-01T00:00:00Z")), Duration::ZERO)
                 }),
                 calls: AtomicUsize::new(0),
             },
-            BlockingSink {
+            Arc::new(RevisionCoordinator::new(BlockingSink {
                 calls: AtomicUsize::new(0),
                 started: Semaphore::new(0),
                 released: AtomicBool::new(false),
                 changed: tokio::sync::Notify::new(),
-            },
+            })),
             &notion,
             &values,
         ));
@@ -746,7 +760,7 @@ mod tests {
             .coordinator
             .sink
             .started
-            .acquire_many(2)
+            .acquire()
             .await
             .unwrap()
             .forget();
@@ -780,7 +794,7 @@ mod tests {
                 .sink
                 .calls
                 .load(Ordering::SeqCst),
-            2
+            1
         );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 0);
 
@@ -795,6 +809,15 @@ mod tests {
             owner.await.unwrap().unwrap();
         }
         duplicate.await.unwrap().unwrap();
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            2
+        );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 2);
 
         dispatcher
@@ -866,14 +889,13 @@ mod tests {
                 .dispatch(event("other", "page-b", "task-source-placeholder"))
                 .await
         });
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            dispatcher.inner.coordinator.sink.started.acquire(),
-        )
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while dispatcher.inner.adapter.calls.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .expect("race loser must release admission for unrelated work")
-        .unwrap()
-        .forget();
+        .expect("race loser must release admission for unrelated discovery");
 
         assert_eq!(dispatcher.inner.adapter.calls.load(Ordering::SeqCst), 2);
         assert_eq!(
@@ -883,7 +905,7 @@ mod tests {
                 .sink
                 .calls
                 .load(Ordering::SeqCst),
-            2
+            1
         );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 0);
         assert_eq!(
@@ -908,6 +930,15 @@ mod tests {
             duplicate.await.unwrap().unwrap();
         }
         unrelated.await.unwrap().unwrap();
+        assert_eq!(
+            dispatcher
+                .inner
+                .coordinator
+                .sink
+                .calls
+                .load(Ordering::SeqCst),
+            2
+        );
         assert_eq!(dispatcher.inner.work_permits.available_permits(), 2);
     }
 

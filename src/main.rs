@@ -11,6 +11,7 @@ mod notion;
 #[allow(dead_code)]
 mod orchestration;
 mod reconciliation;
+mod serving;
 #[allow(dead_code)]
 mod state;
 
@@ -63,16 +64,12 @@ fn main() -> ExitCode {
                     &config.journal_values,
                 )
                 .and_then(|notion| {
-                    let dispatcher = discovery::NotionEventDispatcher::new(
+                    serving::serve(
+                        &config,
+                        &enrollment::FileTokenStore::new(paths.state_directory),
                         notion,
-                        coordination::PendingPreparationSink,
                         &config.notion,
                         &config.task_values,
-                    );
-                    http::serve(
-                        &config.runner,
-                        &enrollment::FileTokenStore::new(paths.state_directory),
-                        dispatcher,
                     )
                 }),
                 Command::RunOnce => notion::NotionHttpClient::new(

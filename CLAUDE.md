@@ -25,6 +25,7 @@ The project is currently a minimal Rust CLI:
   and the downstream discovery boundary.
 - `src/enrollment.rs`: fakeable webhook-token enrollment and private file storage.
 - `src/http.rs`: loopback HTTP serving, webhook authentication, and async dispatch boundary.
+- `src/serving.rs`: serve startup, periodic reconciliation, and coordinated shutdown lifecycle.
 - `src/notion.rs`: fakeable Notion task refetch adapter and production HTTP client.
 - `src/orchestration.rs`: provider-neutral pre-launch preparation and Notion
   visibility gate.
