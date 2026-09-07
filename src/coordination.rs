@@ -16,8 +16,10 @@ pub(crate) trait PreparationSink: Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 }
 
+#[cfg(test)]
 pub(crate) struct PendingPreparationSink;
 
+#[cfg(test)]
 impl PreparationSink for PendingPreparationSink {
     fn prepare<'a>(
         &'a self,

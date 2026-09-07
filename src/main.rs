@@ -6,15 +6,12 @@ mod config;
 mod coordination;
 mod discovery;
 mod enrollment;
-#[allow(dead_code)]
 mod executor;
 mod http;
 mod notion;
-#[allow(dead_code)]
 mod orchestration;
 mod reconciliation;
 mod serving;
-#[allow(dead_code)]
 mod state;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +65,8 @@ fn main() -> ExitCode {
                 .and_then(|notion| {
                     serving::serve(
                         &config,
-                        &enrollment::FileTokenStore::new(paths.state_directory),
+                        &enrollment::FileTokenStore::new(paths.state_directory.clone()),
+                        paths.state_directory,
                         notion,
                         &config.notion,
                         &config.task_values,
@@ -81,17 +79,23 @@ fn main() -> ExitCode {
                     &config.journal_values,
                 )
                 .and_then(|notion| {
-                    let _runner_lock =
-                        state::AttemptStore::new(paths.state_directory.clone()).acquire()?;
+                    let runner_lock = std::sync::Arc::new(
+                        state::AttemptStore::new(paths.state_directory.clone()).acquire()?,
+                    );
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .map_err(|_| "cannot initialize run-once runtime".to_owned())?;
+                    let workflow = orchestration::ExecutionWorkflow::new(
+                        runner_lock,
+                        notion.clone(),
+                        executor::CodexExecutor::new(config.codex.clone()),
+                        config.task_values.clone(),
+                        config.journal_values.executor.clone(),
+                    );
                     let count = runtime.block_on(reconciliation::reconcile_once(
                         &notion,
-                        &coordination::RevisionCoordinator::new(
-                            coordination::PendingPreparationSink,
-                        ),
+                        &coordination::RevisionCoordinator::new(workflow),
                         &config.notion,
                         &config.task_values,
                     ))?;

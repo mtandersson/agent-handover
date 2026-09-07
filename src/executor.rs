@@ -1,5 +1,5 @@
 use crate::config::CodexConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -24,7 +24,7 @@ pub(crate) struct ExecutorRequest {
     pub(crate) instructions: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecutorResult {
     pub(crate) outcome: Outcome,
@@ -33,7 +33,7 @@ pub(crate) struct ExecutorResult {
     pub(crate) warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
     Done,
@@ -155,10 +155,7 @@ impl Executor for CodexExecutor {
         {
             return Err("Codex executor returned an invalid result".to_owned());
         }
-        match result.outcome {
-            Outcome::Done => Ok(result),
-            Outcome::Error => Err("Codex executor reported incomplete or blocked work".to_owned()),
-        }
+        Ok(result)
     }
 }
 
@@ -384,11 +381,9 @@ mod tests {
             .execute(ExecutorRequest {
                 instructions: "private instructions".to_owned(),
             })
-            .unwrap_err();
-        assert_eq!(
-            blocked,
-            "Codex executor reported incomplete or blocked work"
-        );
+            .unwrap();
+        assert_eq!(blocked.outcome, Outcome::Error);
+        assert_eq!(blocked.summary, "blocked");
         let _ = fs::remove_file(blocked_program);
     }
 }
