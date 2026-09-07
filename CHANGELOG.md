@@ -1,3 +1,13 @@
+## [0.9.0](https://github.com/mtandersson/agent-handover/compare/v0.8.0...v0.9.0) (2026-09-07)
+
+### Features
+
+* **executor:** add Codex CLI adapter ([0484132](https://github.com/mtandersson/agent-handover/commit/0484132c2e2ed7966f9b6a4b9fae2bf590c1762e))
+
+### Chores
+
+* **deps:** update rust crate toml to v1.1.5 ([#56](https://github.com/mtandersson/agent-handover/issues/56)) ([f2a9def](https://github.com/mtandersson/agent-handover/commit/f2a9def97d8aa827e53b8b417549c8878452ed19))
+
 ## [0.8.0](https://github.com/mtandersson/agent-handover/compare/v0.7.0...v0.8.0) (2026-09-01)
 
 ### Features
