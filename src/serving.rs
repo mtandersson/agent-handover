@@ -1,12 +1,14 @@
 use crate::config::{Config, NotionConfig, TaskValues};
-use crate::coordination::{PendingPreparationSink, PreparationSink, RevisionCoordinator};
+use crate::coordination::{PreparationSink, RevisionCoordinator};
 use crate::discovery::NotionEventDispatcher;
 use crate::enrollment::TokenSource;
 use crate::http;
 use crate::notion::{NotionAdapter, NotionHttpClient};
+use crate::orchestration::ExecutionWorkflow;
 use crate::reconciliation::reconcile_once;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -15,6 +17,7 @@ use tokio::sync::watch;
 pub(crate) fn serve<T: TokenSource>(
     config: &Config,
     token_source: &T,
+    state_directory: PathBuf,
     notion: NotionHttpClient,
     notion_config: &NotionConfig,
     task_values: &TaskValues,
@@ -29,7 +32,15 @@ pub(crate) fn serve<T: TokenSource>(
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start HTTP runtime: {error}"))?;
-    let coordinator = Arc::new(RevisionCoordinator::new(PendingPreparationSink));
+    let store = Arc::new(crate::state::AttemptStore::new(state_directory).acquire()?);
+    let workflow = ExecutionWorkflow::new(
+        store,
+        notion.clone(),
+        crate::executor::CodexExecutor::new(config.codex.clone()),
+        config.task_values.clone(),
+        config.journal_values.executor.clone(),
+    );
+    let coordinator = Arc::new(RevisionCoordinator::new(workflow));
     let dispatcher = NotionEventDispatcher::with_coordinator(
         notion.clone(),
         Arc::clone(&coordinator),

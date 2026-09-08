@@ -10,9 +10,10 @@ webhook-token enrollment, authenticated webhook HTTP intake, authoritative
 Notion task refetching, deterministic task-body rendering, reconciliation, and
 build and release tooling. `serve` reconciles Pending tasks at startup and at
 the configured interval while continuing to accept health checks and webhook
-signals. Both discovery sources share revision-aware sequential preparation;
-the preparation sink does not enqueue or launch Codex yet. Follow the
-[roadmap](#roadmap) for the remaining implementation sequence.
+signals. Both discovery sources share one revision-aware workflow that prepares
+visible attempts, launches Codex sequentially, and durably stores validated
+results. Follow the [roadmap](#roadmap) for the remaining implementation
+sequence.
 
 ## Intended capabilities
 
@@ -31,11 +32,11 @@ executor boundary and shared journal remain provider-neutral, but a Claude
 adapter, multiple host profiles, concurrent execution, and automatic agent
 retries are out of scope.
 
-Private local state now provides the process-lock and prepared-attempt
-foundation for later orchestration. `run-once` performs one reconciliation;
+Private local state provides the process lock and durable launch authority.
+`run-once` performs one reconciliation;
 `serve` performs one before HTTP intake begins and repeats it at the configured
 interval. Webhook and reconciliation discoveries share a revision-aware,
-provider-neutral, sequential preparation boundary.
+provider-neutral, sequential execution boundary.
 
 ## Architecture
 
@@ -68,7 +69,9 @@ connection webhook, expose only that route through Cloudflare Tunnel, and start
 `agent-handover serve`. Before accepting HTTP requests, the server completes
 one authoritative reconciliation. It then authenticates webhook JSON and
 repeats reconciliation at the configured interval without pausing health or
-webhook intake. Executor launch remains a later roadmap step.
+webhook intake. Eligible tasks are made visibly `Running`, executed one at a
+time, and have their validated result saved in private durable state. Terminal
+Notion finalization remains a later roadmap step.
 
 ## Notion setup
 
@@ -277,8 +280,8 @@ The runner interface is:
 
 | Command | Target behavior |
 | --- | --- |
-| `agent-handover serve` | Reconcile Pending tasks at startup, then serve health and authenticated webhook routes while repeating reconciliation at the configured interval; all eligible discoveries enter preparation sequentially |
-| `agent-handover run-once` | Query and authoritatively validate current Pending tasks once, then hand them to preparation sequentially |
+| `agent-handover serve` | Reconcile Pending tasks at startup, then serve health and authenticated webhook routes while repeating reconciliation at the configured interval; all eligible discoveries execute sequentially |
+| `agent-handover run-once` | Query and authoritatively validate current Pending tasks once, execute them sequentially, and wait for the complete drain |
 | `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
 | `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
 
@@ -303,7 +306,8 @@ printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
 
 ## Task lifecycle and safety
 
-An eligible task follows this lifecycle (later steps remain target behavior):
+An eligible task follows this lifecycle; terminal projection remains target
+behavior:
 
 1. Discovery confirms `Status = Pending` from current Notion state; the private
    host profile supplies Codex as the executor.
@@ -322,12 +326,10 @@ Notion status is an observable projection, not a distributed lock.
 pagination, then refetches every candidate before accepting it. Candidates
 whose source, current Pending status, trash state, or observed revision no
 longer matches are ignored. The accepted set is ordered by authoritative
-`last_edited_time`, with page ID as a stable tie-breaker, and handed to the
-shared provider-neutral revision coordinator one task at a time. A revision is
-remembered only after preparation accepts it, so a failed handoff remains
-retryable. The command returns only after the complete cycle or a content-free
-actionable error. This step does not write task status or journal records and
-does not launch an executor.
+`last_edited_time`, with page ID as a stable tie-breaker, and executed through
+the shared provider-neutral revision coordinator one task at a time. The
+command returns only after the complete cycle or a content-free actionable
+error.
 
 `serve` performs the same authoritative reconciliation before its HTTP accept
 loop is considered started. It then repeats the cycle every
@@ -339,15 +341,15 @@ cycle emits a content-free diagnostic and the next configured cycle still
 runs. Clean shutdown stops HTTP intake and waits for an active reconciliation
 and preparation handoff to finish; it does not abandon that work midway.
 
-Each local prepared record is durably published with mode `0600` before later
-orchestration performs remote writes. The pre-launch orchestration boundary can
-now update and read back `Running`, create the initial journal record, and query
-its immutable run ID. An ambiguous creation response is resolved by that query
-without a second create, and no launch-ready value is exposed until both remote
-records match. This boundary is not yet wired into discovery or an executor.
-The local record contains only an immutable random run
-ID, an opaque task key, and the prepared state; task instructions, executor
-output, secrets, and host paths are excluded. The non-blocking process lock
+Each local attempt is durably published with mode `0600` before orchestration
+performs remote writes. The workflow updates and reads back `Running`, creates
+the initial journal record, and queries its immutable run ID. An ambiguous
+creation response is resolved by that query without a second create, and Codex
+is not launched until both remote records match. The runner then persists
+`launch_intent`, invokes Codex with only the rendered task body, validates its
+structured result, and stores that result durably before returning. Discovery
+never relaunches an attempt whose launch boundary was crossed. Records exclude
+task instructions, secrets, and host paths. The non-blocking process lock
 rejects a second owner for the same state directory and is released when its
 owner exits.
 

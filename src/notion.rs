@@ -63,6 +63,10 @@ impl TaskRevision {
     pub(crate) fn instant(&self) -> OffsetDateTime {
         self.instant
     }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.value
+    }
 }
 
 pub trait NotionAdapter: Send + Sync + 'static {

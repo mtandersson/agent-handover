@@ -1,3 +1,4 @@
+use crate::executor::ExecutorResult;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -9,7 +10,8 @@ const ATTEMPTS_DIRECTORY: &str = "attempts";
 const LOCK_FILE: &str = "runner.lock";
 const RECORD_VERSION: u8 = 1;
 const MAX_TASK_KEY_BYTES: usize = 512;
-const MAX_RECORD_BYTES: u64 = 4096;
+const MAX_TASK_REVISION_BYTES: usize = 64;
+const MAX_RECORD_BYTES: u64 = 128 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct AttemptStore {
@@ -27,13 +29,19 @@ pub(crate) struct PreparedAttempt {
     version: u8,
     run_id: String,
     task_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_revision: Option<String>,
     state: AttemptState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<ExecutorResult>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AttemptState {
     Prepared,
+    LaunchIntent,
+    ResultStored,
 }
 
 impl AttemptStore {
@@ -58,6 +66,23 @@ impl AttemptStore {
 
 impl LockedAttemptStore {
     pub(crate) fn prepare(&self, task_key: &str) -> Result<PreparedAttempt, String> {
+        self.prepare_for_revision(task_key, None)
+    }
+
+    pub(crate) fn prepare_revision(
+        &self,
+        task_key: &str,
+        task_revision: &str,
+    ) -> Result<PreparedAttempt, String> {
+        validate_task_revision(task_revision)?;
+        self.prepare_for_revision(task_key, Some(task_revision))
+    }
+
+    fn prepare_for_revision(
+        &self,
+        task_key: &str,
+        task_revision: Option<&str>,
+    ) -> Result<PreparedAttempt, String> {
         validate_task_key(task_key)?;
         loop {
             let run_id = generate_run_id()?;
@@ -65,7 +90,9 @@ impl LockedAttemptStore {
                 version: RECORD_VERSION,
                 run_id: run_id.clone(),
                 task_key: task_key.to_owned(),
+                task_revision: task_revision.map(str::to_owned),
                 state: AttemptState::Prepared,
+                result: None,
             };
             match persist_new_record(&self.attempts_directory, &run_id, &attempt) {
                 Ok(()) => return Ok(attempt),
@@ -106,6 +133,10 @@ impl LockedAttemptStore {
         if attempt.version != RECORD_VERSION
             || attempt.run_id != run_id
             || validate_task_key(&attempt.task_key).is_err()
+            || attempt
+                .task_revision
+                .as_deref()
+                .is_some_and(|revision| validate_task_revision(revision).is_err())
         {
             return Err("prepared attempt is invalid".to_owned());
         }
@@ -134,6 +165,41 @@ impl LockedAttemptStore {
         run_ids.sort_unstable();
         run_ids.iter().map(|run_id| self.load(run_id)).collect()
     }
+
+    pub(crate) fn task_revision_has_launch_intent(
+        &self,
+        task_key: &str,
+        task_revision: &str,
+    ) -> Result<bool, String> {
+        validate_task_revision(task_revision)?;
+        Ok(self.list_prepared()?.iter().any(|attempt| {
+            attempt.task_key == task_key
+                && attempt.state != AttemptState::Prepared
+                && attempt
+                    .task_revision
+                    .as_deref()
+                    .is_none_or(|known| known == task_revision)
+        }))
+    }
+
+    pub(crate) fn record_launch_intent(&self, run_id: &str) -> Result<(), String> {
+        let mut attempt = self.load(run_id)?;
+        if attempt.state != AttemptState::Prepared || attempt.result.is_some() {
+            return Err("prepared attempt is not launchable".to_owned());
+        }
+        attempt.state = AttemptState::LaunchIntent;
+        replace_record(&self.attempts_directory, run_id, &attempt)
+    }
+
+    pub(crate) fn store_result(&self, run_id: &str, result: ExecutorResult) -> Result<(), String> {
+        let mut attempt = self.load(run_id)?;
+        if attempt.state != AttemptState::LaunchIntent || attempt.result.is_some() {
+            return Err("executor result cannot be stored for this attempt".to_owned());
+        }
+        attempt.state = AttemptState::ResultStored;
+        attempt.result = Some(result);
+        replace_record(&self.attempts_directory, run_id, &attempt)
+    }
 }
 
 impl PreparedAttempt {
@@ -141,9 +207,43 @@ impl PreparedAttempt {
         &self.run_id
     }
 
+    #[cfg(test)]
     pub(crate) fn task_key(&self) -> &str {
         &self.task_key
     }
+
+    #[cfg(test)]
+    pub(crate) fn result(&self) -> Option<&ExecutorResult> {
+        self.result.as_ref()
+    }
+}
+
+fn replace_record(directory: &Path, run_id: &str, attempt: &PreparedAttempt) -> Result<(), String> {
+    let temporary_path = directory.join(format!(".{run_id}.tmp"));
+    let final_path = directory.join(format!("{run_id}.json"));
+    let _ = fs::remove_file(&temporary_path);
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&temporary_path)
+        .map_err(|_| "cannot update prepared attempt".to_owned())?;
+    let outcome = (|| {
+        serde_json::to_writer(&mut temporary, attempt)
+            .map_err(|_| "cannot encode prepared attempt".to_owned())?;
+        temporary
+            .write_all(b"\n")
+            .and_then(|_| temporary.sync_all())
+            .map_err(|_| "cannot persist prepared attempt".to_owned())?;
+        fs::rename(&temporary_path, &final_path)
+            .map_err(|_| "cannot publish prepared attempt update".to_owned())?;
+        sync_directory(directory).map_err(|_| "cannot persist prepared attempt".to_owned())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_file(temporary_path);
+    }
+    outcome
 }
 
 fn open_private_lock(path: &Path) -> Result<File, String> {
@@ -252,6 +352,13 @@ fn validate_task_key(task_key: &str) -> Result<(), String> {
         return Err(
             "task key must be non-empty, bounded, and contain no control characters".to_owned(),
         );
+    }
+    Ok(())
+}
+
+fn validate_task_revision(revision: &str) -> Result<(), String> {
+    if revision.is_empty() || revision.len() > MAX_TASK_REVISION_BYTES || !revision.is_ascii() {
+        return Err("task revision must be non-empty, bounded, and ASCII".to_owned());
     }
     Ok(())
 }
