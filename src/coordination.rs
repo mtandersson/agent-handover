@@ -14,6 +14,10 @@ pub(crate) trait PreparationSink: Send + Sync + 'static {
         &'a self,
         task: DiscoveredTask,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+    fn recover<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send + 'a>> {
+        Box::pin(async { Ok(0) })
+    }
 }
 
 #[cfg(test)]
@@ -94,6 +98,11 @@ where
         let accepted = self.prepare_serialized(task).await;
         lease.release().await;
         accepted
+    }
+
+    pub(crate) async fn recover(&self) -> Result<usize, String> {
+        let _preparation = self.preparation.lock().await;
+        self.sink.recover().await
     }
 
     async fn prepare_serialized(&self, task: DiscoveredTask) -> Result<bool, String> {

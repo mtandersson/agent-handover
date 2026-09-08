@@ -323,7 +323,9 @@ at a time. Local run records are the authority for automatic launch decisions;
 Notion status is an observable projection, not a distributed lock.
 
 `run-once` queries the configured task data source once, following bounded
-pagination, then refetches every candidate before accepting it. Candidates
+pagination, after first resuming any locally prepared attempt that has not
+crossed its launch boundary. It then refetches every candidate before accepting
+it. Candidates
 whose source, current Pending status, trash state, or observed revision no
 longer matches are ignored. The accepted set is ordered by authoritative
 `last_edited_time`, with page ID as a stable tie-breaker, and executed through
@@ -331,8 +333,8 @@ the shared provider-neutral revision coordinator one task at a time. The
 command returns only after the complete cycle or a content-free actionable
 error.
 
-`serve` performs the same authoritative reconciliation before its HTTP accept
-loop is considered started. It then repeats the cycle every
+`serve` performs the same pre-launch recovery and authoritative reconciliation
+before its HTTP accept loop is considered started. It then repeats the cycle every
 `runner.reconciliation_interval_seconds` while health checks and authenticated
 webhook signals remain active. Scheduled and webhook discoveries share one
 revision coordinator and one sequential preparation boundary, so the same or
@@ -352,6 +354,12 @@ never relaunches an attempt whose launch boundary was crossed. Records exclude
 task instructions, secrets, and host paths. The non-blocking process lock
 rejects a second owner for the same state directory and is released when its
 owner exits.
+
+At startup, a locally prepared attempt remains launch authority even if the
+previous process already made its Notion task and journal visibly `Running`.
+The runner refetches and renders that task, queries the journal by the original
+run ID before attempting creation, and crosses the launch boundary for that
+same run ID at most once. Ambiguous duplicate prepared records fail safely.
 
 ### Recovery and retries
 

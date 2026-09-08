@@ -1,5 +1,6 @@
 use crate::executor::ExecutorResult;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -137,6 +138,7 @@ impl LockedAttemptStore {
                 .task_revision
                 .as_deref()
                 .is_some_and(|revision| validate_task_revision(revision).is_err())
+            || !attempt.has_valid_state()
         {
             return Err("prepared attempt is invalid".to_owned());
         }
@@ -171,6 +173,7 @@ impl LockedAttemptStore {
         task_key: &str,
         task_revision: &str,
     ) -> Result<bool, String> {
+        validate_task_key(task_key)?;
         validate_task_revision(task_revision)?;
         Ok(self.list_prepared()?.iter().any(|attempt| {
             attempt.task_key == task_key
@@ -180,6 +183,40 @@ impl LockedAttemptStore {
                     .as_deref()
                     .is_none_or(|known| known == task_revision)
         }))
+    }
+
+    pub(crate) fn prepared_for_revision(
+        &self,
+        task_key: &str,
+        task_revision: &str,
+    ) -> Result<Option<PreparedAttempt>, String> {
+        validate_task_key(task_key)?;
+        validate_task_revision(task_revision)?;
+        let mut matching = self.list_prepared()?.into_iter().filter(|attempt| {
+            attempt.task_key == task_key
+                && attempt.task_revision.as_deref() == Some(task_revision)
+                && attempt.state == AttemptState::Prepared
+        });
+        let prepared = matching.next();
+        if matching.next().is_some() {
+            return Err("prepared attempt authority is ambiguous".to_owned());
+        }
+        Ok(prepared)
+    }
+
+    pub(crate) fn prepared_before_launch(&self) -> Result<Vec<PreparedAttempt>, String> {
+        let prepared: Vec<_> = self
+            .list_prepared()?
+            .into_iter()
+            .filter(|attempt| attempt.state == AttemptState::Prepared)
+            .collect();
+        let mut authorities = HashSet::new();
+        if prepared.iter().any(|attempt| {
+            !authorities.insert((attempt.task_key.as_str(), attempt.task_revision.as_deref()))
+        }) {
+            return Err("prepared attempt authority is ambiguous".to_owned());
+        }
+        Ok(prepared)
     }
 
     pub(crate) fn record_launch_intent(&self, run_id: &str) -> Result<(), String> {
@@ -192,6 +229,9 @@ impl LockedAttemptStore {
     }
 
     pub(crate) fn store_result(&self, run_id: &str, result: ExecutorResult) -> Result<(), String> {
+        if !result.is_valid() {
+            return Err("executor result is invalid".to_owned());
+        }
         let mut attempt = self.load(run_id)?;
         if attempt.state != AttemptState::LaunchIntent || attempt.result.is_some() {
             return Err("executor result cannot be stored for this attempt".to_owned());
@@ -203,13 +243,25 @@ impl LockedAttemptStore {
 }
 
 impl PreparedAttempt {
+    fn has_valid_state(&self) -> bool {
+        match self.state {
+            AttemptState::Prepared | AttemptState::LaunchIntent => self.result.is_none(),
+            AttemptState::ResultStored => {
+                self.result.as_ref().is_some_and(ExecutorResult::is_valid)
+            }
+        }
+    }
+
     pub(crate) fn run_id(&self) -> &str {
         &self.run_id
     }
 
-    #[cfg(test)]
     pub(crate) fn task_key(&self) -> &str {
         &self.task_key
+    }
+
+    pub(crate) fn task_revision(&self) -> Option<&str> {
+        self.task_revision.as_deref()
     }
 
     #[cfg(test)]
@@ -425,6 +477,7 @@ fn validate_run_id(run_id: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::Outcome;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -435,6 +488,15 @@ mod tests {
             "agent-handover-state-test-{}-{suffix}",
             std::process::id()
         ))
+    }
+
+    fn successful_result() -> ExecutorResult {
+        ExecutorResult {
+            outcome: Outcome::Done,
+            summary: "completed".to_owned(),
+            actions: vec!["updated placeholder".to_owned()],
+            warnings: Vec::new(),
+        }
     }
 
     #[test]
@@ -486,6 +548,159 @@ mod tests {
         assert_ne!(first.run_id(), second.run_id());
         assert!(locked.load(first.run_id()).is_ok());
         assert!(locked.load(second.run_id()).is_ok());
+        drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reopening_before_launch_intent_preserves_the_first_launch_transition() {
+        let directory = temporary_directory();
+        let run_id = {
+            let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+            locked
+                .prepare_revision("task-placeholder", "revision-1")
+                .unwrap()
+                .run_id()
+                .to_owned()
+        };
+
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        assert!(
+            !reopened
+                .task_revision_has_launch_intent("task-placeholder", "revision-1")
+                .unwrap()
+        );
+        reopened.record_launch_intent(&run_id).unwrap();
+        assert!(
+            reopened
+                .task_revision_has_launch_intent("task-placeholder", "revision-1")
+                .unwrap()
+        );
+        assert_eq!(
+            reopened.record_launch_intent(&run_id).unwrap_err(),
+            "prepared attempt is not launchable"
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn multiple_prepared_records_for_one_revision_are_never_chosen_implicitly() {
+        let directory = temporary_directory();
+        let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+        locked
+            .prepare_revision("task-placeholder", "revision-1")
+            .unwrap();
+        locked
+            .prepare_revision("task-placeholder", "revision-1")
+            .unwrap();
+
+        assert_eq!(
+            locked
+                .prepared_for_revision("task-placeholder", "revision-1")
+                .unwrap_err(),
+            "prepared attempt authority is ambiguous"
+        );
+        drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reopening_after_launch_intent_never_permits_another_launch_transition() {
+        let directory = temporary_directory();
+        let run_id = {
+            let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+            let attempt = locked
+                .prepare_revision("task-placeholder", "revision-1")
+                .unwrap();
+            locked.record_launch_intent(attempt.run_id()).unwrap();
+            attempt.run_id().to_owned()
+        };
+
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        assert!(
+            reopened
+                .task_revision_has_launch_intent("task-placeholder", "revision-1")
+                .unwrap()
+        );
+        assert_eq!(
+            reopened.record_launch_intent(&run_id).unwrap_err(),
+            "prepared attempt is not launchable"
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validated_result_survives_reopening_without_another_launch_transition() {
+        let directory = temporary_directory();
+        let run_id = {
+            let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+            let attempt = locked
+                .prepare_revision("task-placeholder", "revision-1")
+                .unwrap();
+            locked.record_launch_intent(attempt.run_id()).unwrap();
+            locked
+                .store_result(attempt.run_id(), successful_result())
+                .unwrap();
+            attempt.run_id().to_owned()
+        };
+
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        assert_eq!(
+            reopened.load(&run_id).unwrap().result(),
+            Some(&successful_result())
+        );
+        assert_eq!(
+            reopened.record_launch_intent(&run_id).unwrap_err(),
+            "prepared attempt is not launchable"
+        );
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn only_validated_results_can_cross_the_durable_result_boundary() {
+        let directory = temporary_directory();
+        let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let attempt = locked.prepare("task-placeholder").unwrap();
+        locked.record_launch_intent(attempt.run_id()).unwrap();
+        let mut invalid = successful_result();
+        invalid.summary = "  ".to_owned();
+
+        assert_eq!(
+            locked.store_result(attempt.run_id(), invalid).unwrap_err(),
+            "executor result is invalid"
+        );
+        let mut oversized = successful_result();
+        oversized.actions = vec!["x".repeat(64 * 1024)];
+        assert_eq!(
+            locked
+                .store_result(attempt.run_id(), oversized)
+                .unwrap_err(),
+            "executor result is invalid"
+        );
+        assert!(locked.load(attempt.run_id()).unwrap().result().is_none());
+        drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inconsistent_persisted_attempt_states_fail_with_content_free_diagnostics() {
+        let directory = temporary_directory();
+        let locked = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let attempt = locked.prepare("task-placeholder").unwrap();
+        let path = directory
+            .join(ATTEMPTS_DIRECTORY)
+            .join(format!("{}.json", attempt.run_id()));
+        let mut record = serde_json::to_value(&attempt).unwrap();
+        record["state"] = serde_json::json!("result_stored");
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+
+        assert_eq!(
+            locked.load(attempt.run_id()).unwrap_err(),
+            "prepared attempt is invalid"
+        );
         drop(locked);
         fs::remove_dir_all(directory).unwrap();
     }
