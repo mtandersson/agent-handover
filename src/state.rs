@@ -6,6 +6,8 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 const ATTEMPTS_DIRECTORY: &str = "attempts";
 const LOCK_FILE: &str = "runner.lock";
@@ -33,6 +35,8 @@ pub(crate) struct PreparedAttempt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_revision: Option<String>,
     state: AttemptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     result: Option<ExecutorResult>,
 }
@@ -43,6 +47,7 @@ enum AttemptState {
     Prepared,
     LaunchIntent,
     ResultStored,
+    Finalized,
 }
 
 impl AttemptStore {
@@ -93,6 +98,7 @@ impl LockedAttemptStore {
                 task_key: task_key.to_owned(),
                 task_revision: task_revision.map(str::to_owned),
                 state: AttemptState::Prepared,
+                completed_at: None,
                 result: None,
             };
             match persist_new_record(&self.attempts_directory, &run_id, &attempt) {
@@ -228,16 +234,40 @@ impl LockedAttemptStore {
         replace_record(&self.attempts_directory, run_id, &attempt)
     }
 
-    pub(crate) fn store_result(&self, run_id: &str, result: ExecutorResult) -> Result<(), String> {
+    pub(crate) fn store_result(
+        &self,
+        run_id: &str,
+        completed_at: &str,
+        result: ExecutorResult,
+    ) -> Result<(), String> {
         if !result.is_valid() {
             return Err("executor result is invalid".to_owned());
         }
+        validate_completed_at(completed_at)?;
         let mut attempt = self.load(run_id)?;
         if attempt.state != AttemptState::LaunchIntent || attempt.result.is_some() {
             return Err("executor result cannot be stored for this attempt".to_owned());
         }
         attempt.state = AttemptState::ResultStored;
         attempt.result = Some(result);
+        attempt.completed_at = Some(completed_at.to_owned());
+        replace_record(&self.attempts_directory, run_id, &attempt)
+    }
+
+    pub(crate) fn result_stored(&self) -> Result<Vec<PreparedAttempt>, String> {
+        Ok(self
+            .list_prepared()?
+            .into_iter()
+            .filter(|attempt| attempt.state == AttemptState::ResultStored)
+            .collect())
+    }
+
+    pub(crate) fn mark_finalized(&self, run_id: &str) -> Result<(), String> {
+        let mut attempt = self.load(run_id)?;
+        if attempt.state != AttemptState::ResultStored || attempt.result.is_none() {
+            return Err("attempt cannot be marked finalized".to_owned());
+        }
+        attempt.state = AttemptState::Finalized;
         replace_record(&self.attempts_directory, run_id, &attempt)
     }
 }
@@ -245,9 +275,15 @@ impl LockedAttemptStore {
 impl PreparedAttempt {
     fn has_valid_state(&self) -> bool {
         match self.state {
-            AttemptState::Prepared | AttemptState::LaunchIntent => self.result.is_none(),
-            AttemptState::ResultStored => {
+            AttemptState::Prepared | AttemptState::LaunchIntent => {
+                self.result.is_none() && self.completed_at.is_none()
+            }
+            AttemptState::ResultStored | AttemptState::Finalized => {
                 self.result.as_ref().is_some_and(ExecutorResult::is_valid)
+                    && self
+                        .completed_at
+                        .as_deref()
+                        .is_some_and(|value| validate_completed_at(value).is_ok())
             }
         }
     }
@@ -264,10 +300,19 @@ impl PreparedAttempt {
         self.task_revision.as_deref()
     }
 
-    #[cfg(test)]
     pub(crate) fn result(&self) -> Option<&ExecutorResult> {
         self.result.as_ref()
     }
+
+    pub(crate) fn completed_at(&self) -> Option<&str> {
+        self.completed_at.as_deref()
+    }
+}
+
+fn validate_completed_at(value: &str) -> Result<(), String> {
+    OffsetDateTime::parse(value, &Rfc3339)
+        .map(|_| ())
+        .map_err(|_| "attempt completion time is invalid".to_owned())
 }
 
 fn replace_record(directory: &Path, run_id: &str, attempt: &PreparedAttempt) -> Result<(), String> {
@@ -641,7 +686,11 @@ mod tests {
                 .unwrap();
             locked.record_launch_intent(attempt.run_id()).unwrap();
             locked
-                .store_result(attempt.run_id(), successful_result())
+                .store_result(
+                    attempt.run_id(),
+                    "2026-01-01T00:01:00Z",
+                    successful_result(),
+                )
                 .unwrap();
             attempt.run_id().to_owned()
         };
@@ -669,16 +718,24 @@ mod tests {
         invalid.summary = "  ".to_owned();
 
         assert_eq!(
-            locked.store_result(attempt.run_id(), invalid).unwrap_err(),
+            locked
+                .store_result(attempt.run_id(), "2026-01-01T00:01:00Z", invalid)
+                .unwrap_err(),
             "executor result is invalid"
         );
         let mut oversized = successful_result();
         oversized.actions = vec!["x".repeat(64 * 1024)];
         assert_eq!(
             locked
-                .store_result(attempt.run_id(), oversized)
+                .store_result(attempt.run_id(), "2026-01-01T00:01:00Z", oversized)
                 .unwrap_err(),
             "executor result is invalid"
+        );
+        assert_eq!(
+            locked
+                .store_result(attempt.run_id(), "not-a-timestamp", successful_result())
+                .unwrap_err(),
+            "attempt completion time is invalid"
         );
         assert!(locked.load(attempt.run_id()).unwrap().result().is_none());
         drop(locked);

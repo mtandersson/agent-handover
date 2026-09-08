@@ -2,7 +2,7 @@ use crate::config::TaskValues;
 use crate::coordination::PreparationSink;
 use crate::discovery::DiscoveredTask;
 use crate::executor::{Executor, ExecutorRequest};
-use crate::notion::{InitialJournalAttempt, NotionAdapter};
+use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
 use std::future::Future;
 use std::pin::Pin;
@@ -72,7 +72,11 @@ where
         .map_err(|_| "executor task stopped unexpectedly".to_owned())?
         .map_err(|_| "executor action failed; automatic retry is disabled".to_owned())?;
         let outcome = result.outcome.clone();
-        self.store.store_result(&run_id, result)?;
+        let completed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
+        self.store.store_result(&run_id, &completed_at, result)?;
+        self.finalize(self.store.load(&run_id)?).await?;
         match outcome {
             crate::executor::Outcome::Done => Ok(()),
             crate::executor::Outcome::Error => Err(
@@ -80,6 +84,68 @@ where
                     .to_owned(),
             ),
         }
+    }
+
+    async fn finalize(&self, attempt: PreparedAttempt) -> Result<(), String> {
+        let result = attempt
+            .result()
+            .cloned()
+            .ok_or_else(|| "attempt result is unavailable".to_owned())?;
+        let initial = self
+            .notion
+            .find_journal_by_run_id(attempt.run_id())
+            .await?
+            .ok_or_else(|| "Notion journal attempt is not visible".to_owned())?;
+        if initial.run_id != attempt.run_id()
+            || initial.task_page_id != attempt.task_key()
+            || initial.executor != self.executor_name
+        {
+            return Err("Notion journal readback does not match the durable attempt".to_owned());
+        }
+        let final_attempt = FinalJournalAttempt {
+            initial,
+            ended_at: attempt
+                .completed_at()
+                .ok_or_else(|| "attempt completion time is unavailable".to_owned())?
+                .to_owned(),
+            result,
+        };
+        let write = self.notion.finalize_journal(&final_attempt).await;
+        match self
+            .notion
+            .find_final_journal_by_run_id(attempt.run_id())
+            .await?
+        {
+            Some(visible) if visible == final_attempt => {}
+            Some(_) => {
+                return Err(
+                    "Notion journal finalization does not match the durable result".to_owned(),
+                );
+            }
+            None => {
+                return Err(write
+                    .err()
+                    .unwrap_or_else(|| "Notion journal finalization is not visible".to_owned()));
+            }
+        }
+        let status = match final_attempt.result.outcome {
+            crate::executor::Outcome::Done => &self.task_values.done,
+            crate::executor::Outcome::Error => &self.task_values.error,
+        };
+        let status_write = self
+            .notion
+            .update_task_status(attempt.task_key(), status)
+            .await;
+        let task = self.notion.refetch_task(attempt.task_key()).await?;
+        if task.page_id != attempt.task_key()
+            || task.in_trash
+            || task.status.as_deref() != Some(status)
+        {
+            return Err(status_write
+                .err()
+                .unwrap_or_else(|| "Notion terminal task status is not visible".to_owned()));
+        }
+        self.store.mark_finalized(attempt.run_id())
     }
 }
 
@@ -105,8 +171,13 @@ where
 
     fn recover<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send + 'a>> {
         Box::pin(async move {
+            let results = self.store.result_stored()?;
+            let finalized = results.len();
+            for attempt in results {
+                self.finalize(attempt).await?;
+            }
             let prepared = self.store.prepared_before_launch()?;
-            let mut recovered = 0;
+            let mut recovered = finalized;
             for attempt in prepared {
                 let revision = attempt
                     .task_revision()
@@ -260,7 +331,7 @@ mod tests {
     use crate::discovery::NotionEventDispatcher;
     use crate::executor::{ExecutorResult, Outcome};
     use crate::http::EventDispatcher;
-    use crate::notion::{PendingTaskPage, TaskRevision, TaskState};
+    use crate::notion::{FinalJournalAttempt, PendingTaskPage, TaskRevision, TaskState};
     use crate::reconciliation::reconcile_once;
     use crate::state::AttemptStore;
     use std::future::Future;
@@ -278,9 +349,17 @@ mod tests {
     struct FakeState {
         visible_status: Option<String>,
         journal: Option<InitialJournalAttempt>,
+        final_journal: Option<FinalJournalAttempt>,
         create_error: Option<String>,
         hide_journal: bool,
         hide_status: bool,
+        hide_terminal_status: bool,
+        terminal_status_error: Option<String>,
+        finalize_error: Option<String>,
+        hide_final_journal: bool,
+        terminal_status_writes: usize,
+        finalizes: usize,
+        wrong_terminal_page: bool,
         creates: usize,
     }
 
@@ -317,9 +396,17 @@ mod tests {
                 state: Arc::new(Mutex::new(FakeState {
                     visible_status: None,
                     journal: None,
+                    final_journal: None,
                     create_error: None,
                     hide_journal: false,
                     hide_status: false,
+                    hide_terminal_status: false,
+                    terminal_status_error: None,
+                    finalize_error: None,
+                    hide_final_journal: false,
+                    terminal_status_writes: 0,
+                    finalizes: 0,
+                    wrong_terminal_page: false,
                     creates: 0,
                 })),
             }
@@ -352,11 +439,17 @@ mod tests {
             page_id: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<TaskState, String>> + Send + 'a>> {
             Box::pin(async move {
+                let state = self.state.lock().unwrap();
+                let terminal = matches!(state.visible_status.as_deref(), Some("Done" | "Error"));
                 Ok(TaskState {
-                    page_id: page_id.to_owned(),
+                    page_id: if terminal && state.wrong_terminal_page {
+                        "different-task".to_owned()
+                    } else {
+                        page_id.to_owned()
+                    },
                     revision: TaskRevision::parse("2026-01-01T00:00:00Z").unwrap(),
                     data_source_id: Some("source-placeholder".to_owned()),
-                    status: self.state.lock().unwrap().visible_status.clone(),
+                    status: state.visible_status.clone(),
                     in_trash: false,
                 })
             })
@@ -374,10 +467,17 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
             Box::pin(async move {
                 let mut state = self.state.lock().unwrap();
-                if !state.hide_status {
+                if !state.hide_status
+                    && !(state.hide_terminal_status && matches!(status, "Done" | "Error"))
+                {
                     state.visible_status = Some(status.to_owned());
                 }
-                Ok(())
+                if matches!(status, "Done" | "Error") {
+                    state.terminal_status_writes += 1;
+                    state.terminal_status_error.clone().map_or(Ok(()), Err)
+                } else {
+                    Ok(())
+                }
             })
         }
         fn create_initial_journal<'a>(
@@ -402,6 +502,32 @@ mod tests {
                     .then(|| state.journal.clone())
                     .flatten()
                     .filter(|entry| entry.run_id == run_id))
+            })
+        }
+        fn finalize_journal<'a>(
+            &'a self,
+            attempt: &'a FinalJournalAttempt,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+            Box::pin(async move {
+                let mut state = self.state.lock().unwrap();
+                state.finalizes += 1;
+                if !state.hide_final_journal {
+                    state.final_journal = Some(attempt.clone());
+                }
+                state.finalize_error.clone().map_or(Ok(()), Err)
+            })
+        }
+        fn find_final_journal_by_run_id<'a>(
+            &'a self,
+            run_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<FinalJournalAttempt>, String>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                let state = self.state.lock().unwrap();
+                Ok((!state.hide_final_journal)
+                    .then(|| state.final_journal.clone())
+                    .flatten()
+                    .filter(|attempt| attempt.initial.run_id == run_id))
             })
         }
     }
@@ -557,7 +683,7 @@ mod tests {
             notion.clone(),
             FakeExecutor {
                 calls: Arc::clone(&calls),
-                notion,
+                notion: notion.clone(),
                 fail: false,
                 outcome: Outcome::Done,
             },
@@ -574,6 +700,14 @@ mod tests {
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].result().unwrap().summary, "completed");
+        assert!(store.result_stored().unwrap().is_empty());
+        let notion_state = notion.state.lock().unwrap();
+        assert_eq!(notion_state.visible_status.as_deref(), Some("Done"));
+        assert_eq!(
+            notion_state.final_journal.as_ref().unwrap().result.outcome,
+            Outcome::Done
+        );
+        drop(notion_state);
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
@@ -660,7 +794,7 @@ mod tests {
             notion.clone(),
             FakeExecutor {
                 calls: Arc::clone(&calls),
-                notion,
+                notion: notion.clone(),
                 fail: false,
                 outcome: Outcome::Done,
             },
@@ -692,7 +826,7 @@ mod tests {
             notion.clone(),
             FakeExecutor {
                 calls: Arc::new(Mutex::new(Vec::new())),
-                notion,
+                notion: notion.clone(),
                 fail: false,
                 outcome: Outcome::Error,
             },
@@ -706,6 +840,227 @@ mod tests {
         );
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts[0].result().unwrap().outcome, Outcome::Error);
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_replays_terminal_writes_without_another_executor_launch() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        notion.state.lock().unwrap().hide_terminal_status = true;
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+        assert_eq!(
+            workflow.prepare(discovered("task body")).await.unwrap_err(),
+            "Notion terminal task status is not visible"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(store.result_stored().unwrap().len(), 1);
+
+        notion.state.lock().unwrap().hide_terminal_status = false;
+        assert_eq!(workflow.recover().await.unwrap(), 1);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert!(store.result_stored().unwrap().is_empty());
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Done")
+        );
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_status_readback_resolves_an_ambiguous_write() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().terminal_status_error = Some("ambiguous response".to_owned());
+        notion.state.lock().unwrap().finalize_error = Some("ambiguous response".to_owned());
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        workflow.prepare(discovered("task body")).await.unwrap();
+
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Done")
+        );
+        assert!(store.result_stored().unwrap().is_empty());
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_replays_an_invisible_journal_finalization_before_terminal_status() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().hide_final_journal = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(
+            workflow.prepare(discovered("task body")).await.unwrap_err(),
+            "Notion journal finalization is not visible"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(notion.state.lock().unwrap().terminal_status_writes, 0);
+        assert_eq!(store.result_stored().unwrap().len(), 1);
+
+        notion.state.lock().unwrap().hide_final_journal = false;
+        assert_eq!(workflow.recover().await.unwrap(), 1);
+        let state = notion.state.lock().unwrap();
+        assert_eq!(state.finalizes, 2);
+        assert_eq!(state.terminal_status_writes, 1);
+        drop(state);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_a_journal_that_does_not_match_durable_authority() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let attempt = store
+            .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store.record_launch_intent(attempt.run_id()).unwrap();
+        store
+            .store_result(
+                attempt.run_id(),
+                "2026-01-01T00:01:00Z",
+                ExecutorResult {
+                    outcome: Outcome::Done,
+                    summary: "completed".to_owned(),
+                    actions: vec!["acted".to_owned()],
+                    warnings: vec![],
+                },
+            )
+            .unwrap();
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().journal = Some(InitialJournalAttempt {
+            run_id: attempt.run_id().to_owned(),
+            task_page_id: "different-task".to_owned(),
+            executor: "Codex".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(
+            workflow.recover().await.unwrap_err(),
+            "Notion journal readback does not match the durable attempt"
+        );
+        let state = notion.state.lock().unwrap();
+        assert_eq!(state.finalizes, 0);
+        assert_eq!(state.terminal_status_writes, 0);
+        assert!(calls.lock().unwrap().is_empty());
+        drop(state);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_readback_rejects_a_different_task_identity() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().wrong_terminal_page = true;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(
+            workflow.prepare(discovered("task body")).await.unwrap_err(),
+            "Notion terminal task status is not visible"
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        assert_eq!(store.result_stored().unwrap().len(), 1);
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();

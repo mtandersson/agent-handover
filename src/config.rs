@@ -301,6 +301,11 @@ pub struct JournalProperties {
     pub task: String,
     pub executor: String,
     pub started_at: String,
+    pub ended_at: String,
+    pub outcome: String,
+    pub summary: String,
+    pub actions: String,
+    pub warnings: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -583,6 +588,26 @@ fn validate(config: &Config) -> Result<(), String> {
             config.journal_properties.started_at.as_str(),
         ),
         (
+            "journal_properties.ended_at",
+            config.journal_properties.ended_at.as_str(),
+        ),
+        (
+            "journal_properties.outcome",
+            config.journal_properties.outcome.as_str(),
+        ),
+        (
+            "journal_properties.summary",
+            config.journal_properties.summary.as_str(),
+        ),
+        (
+            "journal_properties.actions",
+            config.journal_properties.actions.as_str(),
+        ),
+        (
+            "journal_properties.warnings",
+            config.journal_properties.warnings.as_str(),
+        ),
+        (
             "journal_values.executor",
             config.journal_values.executor.as_str(),
         ),
@@ -605,6 +630,11 @@ fn validate(config: &Config) -> Result<(), String> {
         config.journal_properties.task.as_str(),
         config.journal_properties.executor.as_str(),
         config.journal_properties.started_at.as_str(),
+        config.journal_properties.ended_at.as_str(),
+        config.journal_properties.outcome.as_str(),
+        config.journal_properties.summary.as_str(),
+        config.journal_properties.actions.as_str(),
+        config.journal_properties.warnings.as_str(),
     ];
     if journal_property_names
         .into_iter()
@@ -754,6 +784,11 @@ run_id = "Run ID"
 task = "Task"
 executor = "Executor"
 started_at = "Started at"
+ended_at = "Ended at"
+outcome = "Outcome"
+summary = "Summary"
+actions = "Actions"
+warnings = "Warnings"
 
 [journal_values]
 executor = "Codex"
