@@ -2,6 +2,7 @@ mod content;
 
 use self::content::{BlockPage, BlockSource};
 use crate::config::{JournalProperties, JournalValues, NotionConfig, TaskProperties};
+use crate::executor::{ExecutorResult, Outcome};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use serde_json::Value;
 use std::future::Future;
@@ -45,6 +46,13 @@ pub struct InitialJournalAttempt {
     pub task_page_id: String,
     pub executor: String,
     pub started_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalJournalAttempt {
+    pub initial: InitialJournalAttempt,
+    pub ended_at: String,
+    pub result: ExecutorResult,
 }
 
 impl TaskRevision {
@@ -107,6 +115,21 @@ pub trait NotionAdapter: Send + Sync + 'static {
         &'a self,
         _run_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Option<InitialJournalAttempt>, String>> + Send + 'a>>
+    {
+        Box::pin(async { Err("Notion journal lookup is unavailable".to_owned()) })
+    }
+
+    fn finalize_journal<'a>(
+        &'a self,
+        _attempt: &'a FinalJournalAttempt,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async { Err("Notion journal finalization is unavailable".to_owned()) })
+    }
+
+    fn find_final_journal_by_run_id<'a>(
+        &'a self,
+        _run_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<FinalJournalAttempt>, String>> + Send + 'a>>
     {
         Box::pin(async { Err("Notion journal lookup is unavailable".to_owned()) })
     }
@@ -382,6 +405,14 @@ impl NotionHttpClient {
     }
 
     async fn lookup_journal(&self, run_id: &str) -> Result<Option<InitialJournalAttempt>, String> {
+        self.lookup_journal_page(run_id)
+            .await?
+            .as_ref()
+            .map(|page| parse_initial_journal(page, &self.journal_properties))
+            .transpose()
+    }
+
+    async fn lookup_journal_page(&self, run_id: &str) -> Result<Option<Value>, String> {
         let mut url = self.api_root.clone();
         url.path_segments_mut()
             .map_err(|_| "cannot initialize Notion API client".to_owned())?
@@ -420,9 +451,62 @@ impl NotionHttpClient {
         if results.len() > 1 {
             return Err("Notion returned duplicate journal attempts for one run ID".to_owned());
         }
-        results
-            .first()
-            .map(|page| parse_initial_journal(page, p))
+        Ok(results.first().cloned())
+    }
+
+    async fn finalize_existing_journal(&self, attempt: &FinalJournalAttempt) -> Result<(), String> {
+        let page = self
+            .lookup_journal_page(&attempt.initial.run_id)
+            .await?
+            .ok_or_else(|| "Notion journal attempt is not visible".to_owned())?;
+        if parse_initial_journal(&page, &self.journal_properties)? != attempt.initial {
+            return Err("Notion journal readback does not match the durable attempt".to_owned());
+        }
+        let page_id = page
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "Notion returned an invalid journal lookup".to_owned())?;
+        let mut url = self.api_root.clone();
+        url.path_segments_mut()
+            .map_err(|_| "cannot initialize Notion API client".to_owned())?
+            .extend(["v1", "pages", page_id]);
+        let p = &self.journal_properties;
+        let outcome = match attempt.result.outcome {
+            Outcome::Done => "Done",
+            Outcome::Error => "Error",
+        };
+        let actions = serde_json::to_string(&attempt.result.actions)
+            .map_err(|_| "cannot encode journal finalization".to_owned())?;
+        let warnings = serde_json::to_string(&attempt.result.warnings)
+            .map_err(|_| "cannot encode journal finalization".to_owned())?;
+        let response = self
+            .client
+            .patch(url)
+            .json(&serde_json::json!({ "properties": {
+                &p.ended_at: { "date": { "start": attempt.ended_at } },
+                &p.outcome: { "select": { "name": outcome } },
+                &p.summary: { "rich_text": rich_text_fragments(&attempt.result.summary) },
+                &p.actions: { "rich_text": rich_text_fragments(&actions) },
+                &p.warnings: { "rich_text": rich_text_fragments(&warnings) }
+            }}))
+            .send()
+            .await
+            .map_err(|_| "journal finalization outcome is ambiguous".to_owned())?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err("Notion refused journal finalization".to_owned())
+        }
+    }
+
+    async fn lookup_final_journal(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<FinalJournalAttempt>, String> {
+        self.lookup_journal_page(run_id)
+            .await?
+            .as_ref()
+            .map(|page| parse_final_journal(page, &self.journal_properties))
             .transpose()
     }
 }
@@ -469,6 +553,19 @@ impl NotionAdapter for NotionHttpClient {
     ) -> Pin<Box<dyn Future<Output = Result<Option<InitialJournalAttempt>, String>> + Send + 'a>>
     {
         Box::pin(self.lookup_journal(run_id))
+    }
+    fn finalize_journal<'a>(
+        &'a self,
+        attempt: &'a FinalJournalAttempt,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(self.finalize_existing_journal(attempt))
+    }
+    fn find_final_journal_by_run_id<'a>(
+        &'a self,
+        run_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<FinalJournalAttempt>, String>> + Send + 'a>>
+    {
+        Box::pin(self.lookup_final_journal(run_id))
     }
 }
 
@@ -519,6 +616,77 @@ fn parse_initial_journal(
         executor,
         started_at,
     })
+}
+
+fn parse_final_journal(
+    page: &Value,
+    properties: &JournalProperties,
+) -> Result<FinalJournalAttempt, String> {
+    let initial = parse_initial_journal(page, properties)?;
+    let values = page
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "Notion returned an invalid journal lookup".to_owned())?;
+    let ended_at = values
+        .get(&properties.ended_at)
+        .and_then(|v| v.pointer("/date/start"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "Notion journal attempt is not finalized".to_owned())?;
+    let outcome = match values
+        .get(&properties.outcome)
+        .and_then(|v| v.pointer("/select/name"))
+        .and_then(Value::as_str)
+    {
+        Some("Done") => Outcome::Done,
+        Some("Error") => Outcome::Error,
+        _ => return Err("Notion journal attempt is not finalized".to_owned()),
+    };
+    let rich_text = |name: &str| -> Option<String> {
+        Some(
+            values
+                .get(name)?
+                .get("rich_text")?
+                .as_array()?
+                .iter()
+                .map(|item| item.get("plain_text").and_then(Value::as_str))
+                .collect::<Option<Vec<_>>>()?
+                .concat(),
+        )
+    };
+    let summary = rich_text(&properties.summary)
+        .ok_or_else(|| "Notion journal attempt is not finalized".to_owned())?;
+    let list = |name: &str| -> Result<Vec<String>, String> {
+        serde_json::from_str(
+            &rich_text(name).ok_or_else(|| "Notion journal attempt is not finalized".to_owned())?,
+        )
+        .map_err(|_| "Notion journal attempt is not finalized".to_owned())
+    };
+    let result = ExecutorResult {
+        outcome,
+        summary,
+        actions: list(&properties.actions)?,
+        warnings: list(&properties.warnings)?,
+    };
+    if !result.is_valid() {
+        return Err("Notion journal attempt is not finalized".to_owned());
+    }
+    Ok(FinalJournalAttempt {
+        initial,
+        ended_at,
+        result,
+    })
+}
+
+fn rich_text_fragments(value: &str) -> Vec<Value> {
+    let characters: Vec<char> = value.chars().collect();
+    characters
+        .chunks(2_000)
+        .map(|chunk| {
+            let content: String = chunk.iter().collect();
+            serde_json::json!({ "text": { "content": content } })
+        })
+        .collect()
 }
 
 impl BlockSource for NotionHttpClient {
@@ -673,6 +841,11 @@ mod tests {
             task: "Task".to_owned(),
             executor: "Executor".to_owned(),
             started_at: "Started at".to_owned(),
+            ended_at: "Ended at".to_owned(),
+            outcome: "Outcome".to_owned(),
+            summary: "Summary".to_owned(),
+            actions: "Actions".to_owned(),
+            warnings: "Warnings".to_owned(),
         }
     }
 
@@ -724,6 +897,48 @@ mod tests {
             tokio::time::sleep(delay).await;
             let _ = stream.write_all(&response).await;
             request
+        });
+        (
+            reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
+            task,
+        )
+    }
+
+    async fn fake_server_many(
+        responses: Vec<Vec<u8>>,
+    ) -> (reqwest::Url, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    let complete = request
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .is_some_and(|end| {
+                            let headers =
+                                String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length: "))
+                                .and_then(|value| value.parse::<usize>().ok())
+                                .unwrap_or(0);
+                            request.len() >= end + 4 + length
+                        });
+                    if read == 0 || complete {
+                        break;
+                    }
+                }
+                stream.write_all(&response).await.unwrap();
+                requests.push(request);
+            }
+            requests
         });
         (
             reqwest::Url::parse(&format!("http://{address}/")).unwrap(),
@@ -1070,6 +1285,163 @@ mod tests {
         assert_eq!(
             request_json(&request),
             json!({"page_size": 2, "filter": {"property": "Run ID", "title": {"equals": "run-placeholder"}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn production_client_finalizes_the_existing_journal_with_configured_fields() {
+        let found = json!({"results": [{"object": "page", "id": "journal-page", "properties": {
+            "Run ID": {"title": [{"plain_text": "run-placeholder"}]},
+            "Task": {"relation": [{"id": "task-placeholder"}]},
+            "Executor": {"select": {"name": "Codex"}},
+            "Started at": {"date": {"start": "2026-01-01T00:00:00Z"}}
+        }}]})
+        .to_string();
+        let (root, server) =
+            fake_server_many(vec![response("200 OK", &found), response("200 OK", "{}")]).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            &journal_properties(),
+            &journal_values(),
+            root,
+            Duration::from_secs(1),
+            4096,
+        )
+        .unwrap();
+        let attempt = FinalJournalAttempt {
+            initial: InitialJournalAttempt {
+                run_id: "run-placeholder".to_owned(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            ended_at: "2026-01-01T00:01:00Z".to_owned(),
+            result: ExecutorResult {
+                outcome: Outcome::Done,
+                summary: "complete".to_owned(),
+                actions: vec!["first".to_owned(), "second".to_owned()],
+                warnings: vec![],
+            },
+        };
+
+        client.finalize_existing_journal(&attempt).await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&requests[1])
+                .starts_with("PATCH /v1/pages/journal-page HTTP/1.1\r\n")
+        );
+        assert_eq!(
+            request_json(&requests[1]),
+            json!({"properties": {
+                "Ended at": {"date": {"start": "2026-01-01T00:01:00Z"}},
+                "Outcome": {"select": {"name": "Done"}},
+                "Summary": {"rich_text": [{"text": {"content": "complete"}}]},
+                "Actions": {"rich_text": [{"text": {"content": "[\"first\",\"second\"]"}}]},
+                "Warnings": {"rich_text": [{"text": {"content": "[]"}}]}
+            }})
+        );
+    }
+
+    #[tokio::test]
+    async fn production_client_refuses_to_patch_a_changed_journal_identity() {
+        let found = json!({"results": [{"object": "page", "id": "journal-page", "properties": {
+            "Run ID": {"title": [{"plain_text": "run-placeholder"}]},
+            "Task": {"relation": [{"id": "different-task"}]},
+            "Executor": {"select": {"name": "Codex"}},
+            "Started at": {"date": {"start": "2026-01-01T00:00:00Z"}}
+        }}]})
+        .to_string();
+        let (root, server) = fake_server(response("200 OK", &found), Duration::ZERO).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            &journal_properties(),
+            &journal_values(),
+            root,
+            Duration::from_secs(1),
+            4096,
+        )
+        .unwrap();
+        let attempt = FinalJournalAttempt {
+            initial: InitialJournalAttempt {
+                run_id: "run-placeholder".to_owned(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            },
+            ended_at: "2026-01-01T00:01:00Z".to_owned(),
+            result: ExecutorResult {
+                outcome: Outcome::Done,
+                summary: "complete".to_owned(),
+                actions: vec![],
+                warnings: vec![],
+            },
+        };
+
+        assert_eq!(
+            client
+                .finalize_existing_journal(&attempt)
+                .await
+                .unwrap_err(),
+            "Notion journal readback does not match the durable attempt"
+        );
+        let request = server.await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&request)
+                .starts_with("POST /v1/data_sources/journal-placeholder/query HTTP/1.1\r\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn final_journal_readback_round_trips_structured_fragmented_fields() {
+        let body = json!({"results": [{"object": "page", "id": "journal-page", "properties": {
+            "Run ID": {"title": [{"plain_text": "run-placeholder"}]},
+            "Task": {"relation": [{"id": "task-placeholder"}]},
+            "Executor": {"select": {"name": "Codex"}},
+            "Started at": {"date": {"start": "2026-01-01T00:00:00Z"}},
+            "Ended at": {"date": {"start": "2026-01-01T00:01:00Z"}},
+            "Outcome": {"select": {"name": "Error"}},
+            "Summary": {"rich_text": [{"plain_text": "part "}, {"plain_text": "two"}]},
+            "Actions": {"rich_text": [{"plain_text": "[\"first\","}, {"plain_text": "\"second\"]"}]},
+            "Warnings": {"rich_text": [{"plain_text": "[\"warning\"]"}]}
+        }}]}).to_string();
+        let (root, server) = fake_server(response("200 OK", &body), Duration::ZERO).await;
+        let client = NotionHttpClient::with_options(
+            &config(),
+            &properties(),
+            &journal_properties(),
+            &journal_values(),
+            root,
+            Duration::from_secs(1),
+            4096,
+        )
+        .unwrap();
+
+        let found = client
+            .lookup_final_journal("run-placeholder")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(found.result.summary, "part two");
+        assert_eq!(found.result.actions, ["first", "second"]);
+        assert_eq!(found.result.warnings, ["warning"]);
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn final_journal_readback_rejects_missing_or_malformed_terminal_fields() {
+        let page = json!({"properties": {
+            "Run ID": {"title": [{"plain_text": "run-placeholder"}]},
+            "Task": {"relation": [{"id": "task-placeholder"}]},
+            "Executor": {"select": {"name": "Codex"}},
+            "Started at": {"date": {"start": "2026-01-01T00:00:00Z"}}
+        }});
+        assert_eq!(
+            parse_final_journal(&page, &journal_properties()).unwrap_err(),
+            "Notion journal attempt is not finalized"
         );
     }
 

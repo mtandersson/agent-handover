@@ -70,8 +70,9 @@ connection webhook, expose only that route through Cloudflare Tunnel, and start
 one authoritative reconciliation. It then authenticates webhook JSON and
 repeats reconciliation at the configured interval without pausing health or
 webhook intake. Eligible tasks are made visibly `Running`, executed one at a
-time, and have their validated result saved in private durable state. Terminal
-Notion finalization remains a later roadmap step.
+time, have their validated result saved in private durable state, and are
+finalized in the shared journal before their task status becomes `Done` or
+`Error`.
 
 ## Notion setup
 
@@ -219,6 +220,11 @@ run_id = "Run ID"
 task = "Task"
 executor = "Executor"
 started_at = "Started at"
+ended_at = "Ended at"
+outcome = "Outcome"
+summary = "Summary"
+actions = "Actions"
+warnings = "Warnings"
 
 [journal_values]
 executor = "Codex"
@@ -306,8 +312,7 @@ printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
 
 ## Task lifecycle and safety
 
-An eligible task follows this lifecycle; terminal projection remains target
-behavior:
+An eligible task follows this lifecycle:
 
 1. Discovery confirms `Status = Pending` from current Notion state; the private
    host profile supplies Codex as the executor.
@@ -315,8 +320,8 @@ behavior:
 3. It changes the task to `Running`, creates the journal attempt, and verifies
    both are visible before execution.
 4. It persists `launch_intent` immediately before starting Codex once.
-5. It validates and durably saves Codex's structured result before projecting
-   `Done` or `Error` and final journal fields to Notion.
+5. It validates and durably saves Codex's structured result, finalizes the
+   journal, verifies the terminal fields, and then projects `Done` or `Error`.
 
 One process lock protects each stable local state directory, and one task runs
 at a time. Local run records are the authority for automatic launch decisions;
@@ -354,6 +359,11 @@ never relaunches an attempt whose launch boundary was crossed. Records exclude
 task instructions, secrets, and host paths. The non-blocking process lock
 rejects a second owner for the same state directory and is released when its
 owner exits.
+
+At startup, result-stored attempts are finalized first without invoking Codex.
+Journal finalization precedes terminal task status, and both writes are read
+back before the local attempt is marked finalized. Repeating startup or
+`run-once` safely replays incomplete terminal writes by immutable run ID.
 
 At startup, a locally prepared attempt remains launch authority even if the
 previous process already made its Notion task and journal visibly `Running`.
