@@ -225,6 +225,14 @@ impl LockedAttemptStore {
         Ok(prepared)
     }
 
+    pub(crate) fn launch_intents(&self) -> Result<Vec<PreparedAttempt>, String> {
+        Ok(self
+            .list_prepared()?
+            .into_iter()
+            .filter(|attempt| attempt.state == AttemptState::LaunchIntent)
+            .collect())
+    }
+
     pub(crate) fn record_launch_intent(&self, run_id: &str) -> Result<(), String> {
         let mut attempt = self.load(run_id)?;
         if attempt.state != AttemptState::Prepared || attempt.result.is_some() {

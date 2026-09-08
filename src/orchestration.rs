@@ -1,7 +1,7 @@
 use crate::config::TaskValues;
 use crate::coordination::PreparationSink;
 use crate::discovery::DiscoveredTask;
-use crate::executor::{Executor, ExecutorRequest};
+use crate::executor::{Executor, ExecutorRequest, ExecutorResult, Outcome};
 use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
 use std::future::Future;
@@ -147,6 +147,23 @@ where
         }
         self.store.mark_finalized(attempt.run_id())
     }
+
+    async fn recover_interrupted_launch(&self, attempt: PreparedAttempt) -> Result<(), String> {
+        let completed_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
+        self.store.store_result(
+            attempt.run_id(),
+            &completed_at,
+            ExecutorResult {
+                outcome: Outcome::Error,
+                summary: "runner restarted after launch intent; outcome is unknown".to_owned(),
+                actions: Vec::new(),
+                warnings: vec!["outcome unknown; external effects may have occurred".to_owned()],
+            },
+        )?;
+        self.finalize(self.store.load(attempt.run_id())?).await
+    }
 }
 
 impl<N, E> PreparationSink for ExecutionWorkflow<N, E>
@@ -176,8 +193,13 @@ where
             for attempt in results {
                 self.finalize(attempt).await?;
             }
+            let interrupted = self.store.launch_intents()?;
+            let recovered_interrupted = interrupted.len();
+            for attempt in interrupted {
+                self.recover_interrupted_launch(attempt).await?;
+            }
             let prepared = self.store.prepared_before_launch()?;
-            let mut recovered = finalized;
+            let mut recovered = finalized + recovered_interrupted;
             for attempt in prepared {
                 let revision = attempt
                     .task_revision()
@@ -767,6 +789,117 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].run_id(), run_id);
         assert_eq!(attempts[0].result().unwrap().summary, "completed");
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_before_executor_invocation_finalizes_launch_intent_as_unknown_error() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let attempt = store
+            .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store.record_launch_intent(attempt.run_id()).unwrap();
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        notion.state.lock().unwrap().journal = Some(InitialJournalAttempt {
+            run_id: attempt.run_id().to_owned(),
+            task_page_id: "task-placeholder".to_owned(),
+            executor: "Codex".to_owned(),
+            started_at: "2026-01-01T00:00:00Z".to_owned(),
+        });
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(workflow.recover().await.unwrap(), 1);
+        assert!(calls.lock().unwrap().is_empty());
+        {
+            let state = notion.state.lock().unwrap();
+            let final_attempt = state.final_journal.as_ref().unwrap();
+            assert_eq!(final_attempt.initial.run_id, attempt.run_id());
+            assert_eq!(final_attempt.result.outcome, Outcome::Error);
+            assert_eq!(
+                final_attempt.result.warnings,
+                ["outcome unknown; external effects may have occurred"]
+            );
+            assert_eq!(state.visible_status.as_deref(), Some("Error"));
+        }
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(notion.state.lock().unwrap().finalizes, 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_after_executor_invocation_never_relaunches_the_interrupted_attempt() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let attempt = store
+            .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store.record_launch_intent(attempt.run_id()).unwrap();
+        let notion = FakeNotion::new();
+        {
+            let mut state = notion.state.lock().unwrap();
+            state.visible_status = Some("Running".to_owned());
+            state.journal = Some(InitialJournalAttempt {
+                run_id: attempt.run_id().to_owned(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            });
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let executor = FakeExecutor {
+            calls: Arc::clone(&calls),
+            notion: notion.clone(),
+            fail: false,
+            outcome: Outcome::Done,
+        };
+        executor
+            .execute(ExecutorRequest {
+                instructions: "task body".to_owned(),
+            })
+            .unwrap();
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            executor,
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(workflow.recover().await.unwrap(), 1);
+        assert_eq!(calls.lock().unwrap().as_slice(), ["task body"]);
+        let final_attempt = notion.state.lock().unwrap().final_journal.clone().unwrap();
+        assert_eq!(final_attempt.initial.run_id, attempt.run_id());
+        assert_eq!(final_attempt.result.outcome, Outcome::Error);
+        assert_eq!(
+            final_attempt.result.warnings,
+            ["outcome unknown; external effects may have occurred"]
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
