@@ -36,6 +36,53 @@ impl<N, E> ExecutionWorkflow<N, E> {
     }
 }
 
+impl<N, E> ExecutionWorkflow<N, E>
+where
+    N: NotionAdapter,
+    E: Executor + 'static,
+{
+    async fn launch(
+        &self,
+        task: DiscoveredTask,
+        prepared: Option<PreparedAttempt>,
+    ) -> Result<(), String> {
+        let started_at = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
+        let ready = prepare_visible_attempt_for_revision(
+            &self.store,
+            &self.notion,
+            &task.state.page_id,
+            &self.task_values.running,
+            &self.executor_name,
+            &started_at,
+            task.state.revision.as_str(),
+            prepared,
+        )
+        .await?;
+        self.store.record_launch_intent(ready.run_id())?;
+        let run_id = ready.run_id().to_owned();
+        let executor = Arc::clone(&self.executor);
+        let result = tokio::task::spawn_blocking(move || {
+            executor.execute(ExecutorRequest {
+                instructions: task.instructions,
+            })
+        })
+        .await
+        .map_err(|_| "executor task stopped unexpectedly".to_owned())?
+        .map_err(|_| "executor action failed; automatic retry is disabled".to_owned())?;
+        let outcome = result.outcome.clone();
+        self.store.store_result(&run_id, result)?;
+        match outcome {
+            crate::executor::Outcome::Done => Ok(()),
+            crate::executor::Outcome::Error => Err(
+                "executor reported incomplete or blocked work; automatic retry is disabled"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
 impl<N, E> PreparationSink for ExecutionWorkflow<N, E>
 where
     N: NotionAdapter,
@@ -52,39 +99,42 @@ where
             )? {
                 return Ok(());
             }
-            let started_at = OffsetDateTime::now_utc()
-                .format(&Rfc3339)
-                .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
-            let ready = prepare_visible_attempt_for_revision(
-                &self.store,
-                &self.notion,
-                &task.state.page_id,
-                &self.task_values.running,
-                &self.executor_name,
-                &started_at,
-                task.state.revision.as_str(),
-            )
-            .await?;
-            self.store.record_launch_intent(ready.run_id())?;
-            let run_id = ready.run_id().to_owned();
-            let executor = Arc::clone(&self.executor);
-            let result = tokio::task::spawn_blocking(move || {
-                executor.execute(ExecutorRequest {
-                    instructions: task.instructions,
-                })
-            })
-            .await
-            .map_err(|_| "executor task stopped unexpectedly".to_owned())?
-            .map_err(|_| "executor action failed; automatic retry is disabled".to_owned())?;
-            let outcome = result.outcome.clone();
-            self.store.store_result(&run_id, result)?;
-            match outcome {
-                crate::executor::Outcome::Done => Ok(()),
-                crate::executor::Outcome::Error => Err(
-                    "executor reported incomplete or blocked work; automatic retry is disabled"
-                        .to_owned(),
-                ),
+            self.launch(task, None).await
+        })
+    }
+
+    fn recover<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let prepared = self.store.prepared_before_launch()?;
+            let mut recovered = 0;
+            for attempt in prepared {
+                let revision = attempt
+                    .task_revision()
+                    .ok_or_else(|| "prepared attempt is missing its task revision".to_owned())?;
+                let state = self.notion.refetch_task(attempt.task_key()).await?;
+                if state.page_id != attempt.task_key()
+                    || !matches!(
+                        state.status.as_deref(),
+                        Some(status)
+                            if status == self.task_values.pending
+                                || status == self.task_values.running
+                    )
+                {
+                    return Err(
+                        "prepared attempt cannot be recovered from current task state".to_owned(),
+                    );
+                }
+                let task = DiscoveredTask {
+                    state: crate::notion::TaskState {
+                        revision: crate::notion::TaskRevision::parse(revision)?,
+                        ..state
+                    },
+                    instructions: self.notion.render_task(attempt.task_key()).await?,
+                };
+                self.launch(task, Some(attempt)).await?;
+                recovered += 1;
             }
+            Ok(recovered)
         })
     }
 }
@@ -117,10 +167,12 @@ pub(crate) async fn prepare_visible_attempt<N: NotionAdapter>(
         executor,
         started_at,
         None,
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_visible_attempt_for_revision<N: NotionAdapter>(
     store: &LockedAttemptStore,
     notion: &N,
@@ -129,6 +181,7 @@ async fn prepare_visible_attempt_for_revision<N: NotionAdapter>(
     executor: &str,
     started_at: &str,
     task_revision: &str,
+    existing: Option<PreparedAttempt>,
 ) -> Result<LaunchReadyAttempt, String> {
     prepare_visible_attempt_inner(
         store,
@@ -138,6 +191,7 @@ async fn prepare_visible_attempt_for_revision<N: NotionAdapter>(
         executor,
         started_at,
         Some(task_revision),
+        existing,
     )
     .await
 }
@@ -151,10 +205,15 @@ async fn prepare_visible_attempt_inner<N: NotionAdapter>(
     executor: &str,
     started_at: &str,
     task_revision: Option<&str>,
+    existing: Option<PreparedAttempt>,
 ) -> Result<LaunchReadyAttempt, String> {
-    let prepared = match task_revision {
-        Some(revision) => store.prepare_revision(task_page_id, revision)?,
-        None => store.prepare(task_page_id)?,
+    let resuming = existing.is_some();
+    let prepared = match (existing, task_revision) {
+        (Some(prepared), _) => prepared,
+        (None, Some(revision)) => store
+            .prepared_for_revision(task_page_id, revision)?
+            .map_or_else(|| store.prepare_revision(task_page_id, revision), Ok)?,
+        (None, None) => store.prepare(task_page_id)?,
     };
     notion
         .update_task_status(task_page_id, running_status)
@@ -170,6 +229,19 @@ async fn prepare_visible_attempt_inner<N: NotionAdapter>(
         executor: executor.to_owned(),
         started_at: started_at.to_owned(),
     };
+    let already_visible = notion.find_journal_by_run_id(prepared.run_id()).await?;
+    if let Some(record) = already_visible {
+        return if record == journal
+            || (resuming
+                && record.run_id == journal.run_id
+                && record.task_page_id == journal.task_page_id
+                && record.executor == journal.executor)
+        {
+            Ok(LaunchReadyAttempt { prepared })
+        } else {
+            Err("Notion journal readback does not match the prepared attempt".to_owned())
+        };
+    }
     let create_result = notion.create_initial_journal(&journal).await;
     let visible_journal = notion.find_journal_by_run_id(prepared.run_id()).await?;
     match visible_journal {
@@ -502,6 +574,105 @@ mod tests {
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].result().unwrap().summary, "completed");
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_the_same_prepared_run_after_remote_visibility() {
+        let state_directory = directory();
+        let run_id = {
+            let store = AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap();
+            store
+                .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+                .unwrap()
+                .run_id()
+                .to_owned()
+        };
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        {
+            let mut state = notion.state.lock().unwrap();
+            state.visible_status = Some("Running".to_owned());
+            state.journal = Some(InitialJournalAttempt {
+                run_id: run_id.clone(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            });
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(workflow.recover().await.unwrap(), 1);
+
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["rendered-task-placeholder"]
+        );
+        assert_eq!(notion.state.lock().unwrap().creates, 0);
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].run_id(), run_id);
+        assert_eq!(attempts[0].result().unwrap().summary, "completed");
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_never_launches_ambiguous_prepared_authority() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        store
+            .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+            .unwrap();
+        store
+            .prepare_revision("task-placeholder", "2026-01-01T00:00:00Z")
+            .unwrap();
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion,
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        );
+
+        assert_eq!(
+            workflow.recover().await.unwrap_err(),
+            "prepared attempt authority is ambiguous"
+        );
+        assert!(calls.lock().unwrap().is_empty());
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();

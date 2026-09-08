@@ -93,12 +93,17 @@ fn main() -> ExitCode {
                         config.task_values.clone(),
                         config.journal_values.executor.clone(),
                     );
-                    let count = runtime.block_on(reconciliation::reconcile_once(
-                        &notion,
-                        &coordination::RevisionCoordinator::new(workflow),
-                        &config.notion,
-                        &config.task_values,
-                    ))?;
+                    let coordinator = coordination::RevisionCoordinator::new(workflow);
+                    let count = runtime.block_on(async {
+                        coordinator.recover().await?;
+                        reconciliation::reconcile_once(
+                            &notion,
+                            &coordinator,
+                            &config.notion,
+                            &config.task_values,
+                        )
+                        .await
+                    })?;
                     Ok(run_once_response(count))
                 }),
             })

@@ -100,7 +100,10 @@ where
 {
     tokio::pin!(shutdown);
     {
-        let startup = reconcile_once(&notion, &coordinator, notion_config, task_values);
+        let startup = async {
+            coordinator.recover().await?;
+            reconcile_once(&notion, &coordinator, notion_config, task_values).await
+        };
         tokio::pin!(startup);
         tokio::select! {
             result = &mut startup => {

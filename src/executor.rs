@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const MAX_RESULT_BYTES: u64 = 64 * 1024;
+const MAX_RESULT_BYTES: usize = 64 * 1024;
 
 /// Provider-neutral boundary used by orchestration.  The task document is the
 /// complete instruction supplied to an executor; callers must not add prompt
@@ -31,6 +31,18 @@ pub(crate) struct ExecutorResult {
     pub(crate) summary: String,
     pub(crate) actions: Vec<String>,
     pub(crate) warnings: Vec<String>,
+}
+
+impl ExecutorResult {
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.summary.trim().is_empty()
+            && self
+                .actions
+                .iter()
+                .chain(&self.warnings)
+                .all(|value| !value.trim().is_empty())
+            && serde_json::to_vec(self).is_ok_and(|encoded| encoded.len() <= MAX_RESULT_BYTES)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -134,25 +146,19 @@ impl Executor for CodexExecutor {
         if !metadata.file_type().is_file() || metadata.file_type().is_fifo() {
             return Err("Codex result is not a regular file".to_owned());
         }
-        if metadata.len() > MAX_RESULT_BYTES {
+        if metadata.len() > MAX_RESULT_BYTES as u64 {
             return Err("Codex executor returned an oversized result".to_owned());
         }
         let mut bytes = Vec::new();
-        file.take(MAX_RESULT_BYTES + 1)
+        file.take(MAX_RESULT_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| "cannot read Codex result".to_owned())?;
-        if bytes.len() as u64 > MAX_RESULT_BYTES {
+        if bytes.len() > MAX_RESULT_BYTES {
             return Err("Codex executor returned an oversized result".to_owned());
         }
         let result: ExecutorResult = serde_json::from_slice(&bytes)
             .map_err(|_| "Codex executor returned an invalid result".to_owned())?;
-        if result.summary.trim().is_empty()
-            || result
-                .actions
-                .iter()
-                .chain(&result.warnings)
-                .any(|value| value.trim().is_empty())
-        {
+        if !result.is_valid() {
             return Err("Codex executor returned an invalid result".to_owned());
         }
         Ok(result)
