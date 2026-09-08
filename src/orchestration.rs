@@ -369,6 +369,7 @@ mod tests {
     }
 
     struct FakeState {
+        revision: String,
         visible_status: Option<String>,
         journal: Option<InitialJournalAttempt>,
         final_journal: Option<FinalJournalAttempt>,
@@ -416,6 +417,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 state: Arc::new(Mutex::new(FakeState {
+                    revision: "2026-01-01T00:00:00Z".to_owned(),
                     visible_status: None,
                     journal: None,
                     final_journal: None,
@@ -442,12 +444,13 @@ mod tests {
             _pending_status: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<PendingTaskPage, String>> + Send + 'a>> {
             Box::pin(async move {
+                let state = self.state.lock().unwrap();
                 Ok(PendingTaskPage {
                     tasks: vec![TaskState {
                         page_id: "task-placeholder".to_owned(),
-                        revision: TaskRevision::parse("2026-01-01T00:00:00Z").unwrap(),
+                        revision: TaskRevision::parse(&state.revision).unwrap(),
                         data_source_id: Some("source-placeholder".to_owned()),
-                        status: self.state.lock().unwrap().visible_status.clone(),
+                        status: state.visible_status.clone(),
                         in_trash: false,
                     }],
                     next_cursor: None,
@@ -469,7 +472,7 @@ mod tests {
                     } else {
                         page_id.to_owned()
                     },
-                    revision: TaskRevision::parse("2026-01-01T00:00:00Z").unwrap(),
+                    revision: TaskRevision::parse(&state.revision).unwrap(),
                     data_source_id: Some("source-placeholder".to_owned()),
                     status: state.visible_status.clone(),
                     in_trash: false,
@@ -594,6 +597,19 @@ mod tests {
             task_data_source_id: "source-placeholder".to_owned(),
             journal_data_source_id: "journal-placeholder".to_owned(),
         }
+    }
+
+    fn task_event(id: &str, timestamp: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "timestamp": timestamp,
+            "type": "page.properties_updated",
+            "entity": { "id": "task-placeholder", "type": "page" },
+            "data": { "parent": {
+                "type": "database",
+                "data_source_id": "source-placeholder"
+            }}
+        })
     }
 
     #[tokio::test]
@@ -1241,7 +1257,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_newer_pending_revision_can_start_a_manual_retry() {
+    async fn error_to_pending_creates_one_distinct_attempt_for_the_new_revision() {
         let state_directory = directory();
         let store = Arc::new(
             AttemptStore::new(state_directory.clone())
@@ -1249,31 +1265,89 @@ mod tests {
                 .unwrap(),
         );
         let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Pending".to_owned());
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store),
+        let coordinator = Arc::new(crate::coordination::RevisionCoordinator::new(
+            ExecutionWorkflow::new(
+                Arc::clone(&store),
+                notion.clone(),
+                FakeExecutor {
+                    calls: Arc::clone(&calls),
+                    notion: notion.clone(),
+                    fail: false,
+                    outcome: Outcome::Error,
+                },
+                values(),
+                "Codex".to_owned(),
+            ),
+        ));
+        let dispatcher = NotionEventDispatcher::with_coordinator(
             notion.clone(),
-            FakeExecutor {
-                calls: Arc::clone(&calls),
-                notion,
-                fail: true,
-                outcome: Outcome::Done,
-            },
-            values(),
-            "Codex".to_owned(),
+            Arc::clone(&coordinator),
+            &notion_config(),
+            &values(),
         );
 
-        assert!(workflow.prepare(discovered("first")).await.is_err());
+        assert_eq!(
+            dispatcher
+                .dispatch(task_event("first", "2026-01-01T00:00:00Z"))
+                .await
+                .unwrap_err(),
+            "executor reported incomplete or blocked work; automatic retry is disabled"
+        );
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            reconcile_once(&notion, &coordinator, &notion_config(), &values())
+                .await
+                .unwrap(),
+            0
+        );
+        dispatcher
+            .dispatch(task_event("first", "2026-01-01T00:00:00Z"))
+            .await
+            .unwrap();
+
+        {
+            let mut state = notion.state.lock().unwrap();
+            state.visible_status = Some("Pending".to_owned());
+            state.revision = "2026-01-02T00:00:00Z".to_owned();
+        }
         assert!(
-            workflow
-                .prepare(discovered_at("retry", "2026-01-02T00:00:00Z"))
+            dispatcher
+                .dispatch(task_event("late-signal", "2025-12-31T00:00:00Z"))
                 .await
                 .is_err()
         );
+        dispatcher
+            .dispatch(task_event("duplicate-retry", "2026-01-02T00:00:00Z"))
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_once(&notion, &coordinator, &notion_config(), &values())
+                .await
+                .unwrap(),
+            0
+        );
 
-        assert_eq!(calls.lock().unwrap().as_slice(), ["first", "retry"]);
-        assert_eq!(store.list_prepared().unwrap().len(), 2);
-        drop(workflow);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["rendered-task-placeholder", "rendered-task-placeholder"]
+        );
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].run_id(), attempts[1].run_id());
+        assert!(attempts.iter().all(|attempt| attempt.result().is_some()));
+        assert!(store.result_stored().unwrap().is_empty());
+        let state = notion.state.lock().unwrap();
+        assert_eq!(state.creates, 2);
+        assert_eq!(state.finalizes, 2);
+        assert_eq!(state.terminal_status_writes, 2);
+        drop(state);
+        drop(dispatcher);
+        drop(coordinator);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
     }
