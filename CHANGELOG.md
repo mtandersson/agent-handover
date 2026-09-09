@@ -1,3 +1,23 @@
+## [0.10.0](https://github.com/mtandersson/agent-handover/compare/v0.9.0...v0.10.0) (2026-09-09)
+
+### Features
+
+* finalize durable Notion attempts ([8f33645](https://github.com/mtandersson/agent-handover/commit/8f336459615fc32e4ba017bcad872f87c8158abe))
+* **orchestration:** execute discovered tasks ([67ab1a9](https://github.com/mtandersson/agent-handover/commit/67ab1a911e32efb8f55ff9eb449e757c5ac8a2df))
+* **state:** enforce durable launch authority ([7b4a70a](https://github.com/mtandersson/agent-handover/commit/7b4a70a8f3f94ef89d212c32ffea64f5f274149f))
+
+### Bug Fixes
+
+* **recovery:** finalize interrupted launches as unknown ([fde70b0](https://github.com/mtandersson/agent-handover/commit/fde70b0aad3a0ded6dc6f04b5aafaf95e3c101b0))
+
+### Tests
+
+* specify manual error retry lifecycle ([#64](https://github.com/mtandersson/agent-handover/issues/64)) ([0de67ef](https://github.com/mtandersson/agent-handover/commit/0de67efbfcad05bebf8d8af89168a6e432cb354d))
+
+### Chores
+
+* **deps:** update rust crate reqwest to v0.13.5 ([#65](https://github.com/mtandersson/agent-handover/issues/65)) ([d80fadd](https://github.com/mtandersson/agent-handover/commit/d80fadd504b225a7aba2d449ac81352db27d80df))
+
 ## [0.9.0](https://github.com/mtandersson/agent-handover/compare/v0.8.0...v0.9.0) (2026-09-07)
 
 ### Features
