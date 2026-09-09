@@ -64,15 +64,29 @@ nix develop --command cargo run
 nix develop --command cargo test
 ```
 
-The operator flow is to configure and share the Notion data sources, enroll a
-connection webhook, expose only that route through Cloudflare Tunnel, and start
-`agent-handover serve`. Before accepting HTTP requests, the server completes
-one authoritative reconciliation. It then authenticates webhook JSON and
-repeats reconciliation at the configured interval without pausing health or
-webhook intake. Eligible tasks are made visibly `Running`, executed one at a
-time, have their validated result saved in private durable state, and are
-finalized in the shared journal before their task status becomes `Done` or
-`Error`.
+Use the built-in guide for the current command descriptions, prerequisites, and
+examples:
+
+```sh
+agent-handover --help
+```
+
+The normal operator sequence is:
+
+1. Configure and share the Notion task and journal data sources, then create
+   the private host configuration.
+2. Use `run-once` to reconcile and drain current `Pending` tasks without a
+   webhook or public tunnel.
+3. For continuous operation, enroll the connection webhook token, expose only
+   the webhook route through Cloudflare Tunnel, configure the Notion webhook
+   subscription, and start `agent-handover serve`.
+
+Before accepting HTTP requests, `serve` completes one authoritative
+reconciliation. It then authenticates webhook JSON and repeats reconciliation
+at the configured interval without pausing health or webhook intake. Eligible
+tasks are made visibly `Running`, executed one at a time, have their validated
+result saved in private durable state, and are finalized in the shared journal
+before their task status becomes `Done` or `Error`.
 
 ## Notion setup
 
@@ -272,11 +286,12 @@ to `$HOME/.local/state/agent-handover`. The file is created atomically with mode
 
 ## Commands
 
-The CLI supports:
+The CLI supports `--help` / `-h` for an in-terminal setup guide and `--version`
+/ `-V` for its installed version:
 
 ```console
 $ agent-handover
-agent-handover is ready
+agent-handover runs queued Notion tasks through Codex on this host.
 
 $ agent-handover --version
 agent-handover 0.1.0
@@ -293,6 +308,13 @@ The runner interface is:
 
 Unsupported or incomplete configuration will fail with actionable errors that
 do not reveal secrets.
+
+`run-once` requires the private host configuration but does not need an
+enrolled webhook token or public tunnel. `serve` requires the same configuration
+and an enrolled token; public Notion delivery additionally requires the HTTPS
+tunnel and webhook subscription described above. Both commands only run tasks
+whose current `Status` is `Pending`, and send the recursively rendered task
+page body to Codex as its instruction source.
 
 Enrollment is non-interactive and accepts the JSON payload on standard input,
 keeping the token out of command arguments and normal output:
