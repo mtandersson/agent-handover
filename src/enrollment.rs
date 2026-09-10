@@ -1,12 +1,39 @@
-use serde::Deserialize;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use axum::{
+    Router,
+    body::to_bytes,
+    extract::{Request, State},
+    http::{Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::any,
+};
+use hyper::server::conn::http1;
+use hyper_util::{rt::TokioIo, service::TowerToHyperService};
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use std::{
+    fs,
+    fs::OpenOptions,
+    io::{Read, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, Semaphore, oneshot},
+    task::JoinSet,
+};
+use uuid::Uuid;
 
-const TOKEN_FILE: &str = "notion-webhook-verification-token";
+const ENROLLMENT_FILE: &str = "notion-webhook-enrollment.json";
+const ENROLLMENT_ADDRESS: &str = "127.0.0.1:8080";
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
+const MAX_ACTIVE_CONNECTIONS: usize = 16;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
@@ -15,14 +42,19 @@ struct VerificationPayload {
     verification_token: String,
 }
 
-pub trait TokenStore {
-    fn persist(&self, token: &str, rotate: bool) -> Result<(), String>;
+#[derive(Deserialize, Serialize)]
+struct Enrollment {
+    callback_id: Uuid,
+    verification_token: String,
 }
+
+type EnrollmentResultSender = oneshot::Sender<Result<String, String>>;
 
 pub trait TokenSource {
     fn load(&self) -> Result<String, String>;
 }
 
+#[derive(Clone)]
 pub struct FileTokenStore {
     state_directory: PathBuf,
 }
@@ -31,295 +63,307 @@ impl FileTokenStore {
     pub fn new(state_directory: PathBuf) -> Self {
         Self { state_directory }
     }
-
-    fn persist_with_operations<O: CommitOperations>(
-        &self,
-        token: &str,
-        rotate: bool,
-        operations: &O,
-    ) -> Result<(), String> {
-        crate::config::ensure_private_directory(&self.state_directory)?;
-        let destination = self.state_directory.join(TOKEN_FILE);
-        inspect_destination(&destination, rotate)?;
-
-        let temporary = temporary_path(&self.state_directory);
-        let result = write_private_temporary_file(&temporary, token)
-            .and_then(|()| commit_temporary_file(operations, &temporary, &destination, rotate));
-        if result.is_err() {
-            let _ = operations.remove_file(&temporary);
-        }
-        result
+    fn destination(&self) -> PathBuf {
+        self.state_directory.join(ENROLLMENT_FILE)
     }
-}
 
-impl TokenStore for FileTokenStore {
-    fn persist(&self, token: &str, rotate: bool) -> Result<(), String> {
-        self.persist_with_operations(token, rotate, &SystemCommitOperations)
+    fn ensure_available(&self, rotate: bool) -> Result<(), String> {
+        crate::config::ensure_private_directory(&self.state_directory)?;
+        inspect_destination(&self.destination(), rotate)
+    }
+
+    fn persist(&self, enrollment: &Enrollment, rotate: bool) -> Result<(), String> {
+        self.ensure_available(rotate)?;
+        let bytes = serde_json::to_vec(enrollment)
+            .map_err(|_| "cannot encode private webhook enrollment".to_owned())?;
+        let temporary = temporary_path(&self.state_directory);
+        write_private_file(&temporary, &bytes)?;
+        let destination = self.destination();
+        let installed = if rotate {
+            fs::rename(&temporary, &destination)
+                .map_err(|_| "cannot rotate private webhook enrollment".to_owned())
+        } else {
+            fs::hard_link(&temporary, &destination).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    "a Notion webhook enrollment already exists; use --rotate to replace it"
+                        .to_owned()
+                } else {
+                    "cannot install private webhook enrollment".to_owned()
+                }
+            })
+        };
+        if installed.is_err() {
+            let _ = fs::remove_file(&temporary);
+            return installed;
+        }
+        let _ = fs::remove_file(&temporary);
+        fs::File::open(&self.state_directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|_| {
+                "webhook enrollment was installed, but durability confirmation failed".to_owned()
+            })
     }
 }
 
 impl TokenSource for FileTokenStore {
     fn load(&self) -> Result<String, String> {
         crate::config::ensure_private_directory(&self.state_directory)?;
-        let path = self.state_directory.join(TOKEN_FILE);
-        let mut file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    "no Notion webhook verification token is enrolled; run webhook-enroll first"
-                        .to_owned()
-                } else {
-                    format!("cannot safely open webhook token file: {error}")
-                }
+        let enrollment: Enrollment =
+            serde_json::from_slice(&read_private_file(&self.destination())?).map_err(|_| {
+                "private webhook enrollment is malformed; run webhook-enroll --rotate".to_owned()
             })?;
-        let metadata = file
-            .metadata()
-            .map_err(|error| format!("cannot inspect webhook token file: {error}"))?;
-        if !metadata.is_file() {
-            return Err("webhook token path is not a regular file".to_owned());
+        if enrollment.verification_token.trim().is_empty() {
+            Err("private webhook enrollment is incomplete; run webhook-enroll --rotate".to_owned())
+        } else {
+            Ok(enrollment.verification_token)
         }
-        let mode = metadata.mode() & 0o777;
-        if mode != 0o600 {
-            return Err(format!(
-                "webhook token file must have mode 0600, not {mode:04o}"
-            ));
-        }
-        let mut token = String::new();
-        file.read_to_string(&mut token)
-            .map_err(|error| format!("cannot read webhook token file: {error}"))?;
-        if token.is_empty() {
-            return Err("webhook token file is empty; rotate the enrolled token".to_owned());
-        }
-        Ok(token)
     }
 }
 
-trait CommitOperations {
-    fn hard_link(&self, source: &Path, destination: &Path) -> std::io::Result<()>;
-    fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()>;
-    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
-    fn sync_directory(&self, path: &Path) -> std::io::Result<()>;
-}
-
-struct SystemCommitOperations;
-
-impl CommitOperations for SystemCommitOperations {
-    fn hard_link(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
-        fs::hard_link(source, destination)
-    }
-
-    fn rename(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
-        fs::rename(source, destination)
-    }
-
-    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        fs::remove_file(path)
-    }
-
-    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
-        fs::File::open(path)?.sync_all()
-    }
-}
-
-pub fn enroll<R: Read, S: TokenStore>(
-    mut input: R,
-    store: &S,
+#[derive(Clone)]
+struct HttpState {
+    expected_path: Arc<str>,
+    callback_id: Uuid,
+    store: FileTokenStore,
     rotate: bool,
-) -> Result<String, String> {
-    let mut contents = String::new();
-    input
-        .read_to_string(&mut contents)
-        .map_err(|_| "cannot read webhook verification payload from standard input".to_owned())?;
-    let payload: VerificationPayload = serde_json::from_str(&contents).map_err(|_| {
-        "invalid webhook verification payload: expected JSON with verification_token".to_owned()
-    })?;
-    if payload.verification_token.trim().is_empty() {
-        return Err(
-            "invalid webhook verification payload: verification_token must not be empty".to_owned(),
-        );
-    }
+    result: Arc<Mutex<Option<EnrollmentResultSender>>>,
+}
 
-    store.persist(&payload.verification_token, rotate)?;
-    Ok(if rotate {
-        "Notion webhook verification token rotated".to_owned()
+pub async fn enroll<W: Write>(
+    hostname: &str,
+    store: &FileTokenStore,
+    rotate: bool,
+    output: &mut W,
+) -> Result<String, String> {
+    validate_hostname(hostname)?;
+    store.ensure_available(rotate)?;
+    let callback_id = Uuid::new_v4();
+    let listener = TcpListener::bind(ENROLLMENT_ADDRESS).await.map_err(|_| {
+        "cannot bind the loopback enrollment listener; port 8080 may be occupied".to_owned()
+    })?;
+    enroll_with_listener(hostname, callback_id, listener, store, rotate, output).await
+}
+
+async fn enroll_with_listener<W: Write>(
+    hostname: &str,
+    callback_id: Uuid,
+    listener: TcpListener,
+    store: &FileTokenStore,
+    rotate: bool,
+    output: &mut W,
+) -> Result<String, String> {
+    let path = format!("/notion/webhook/{callback_id}");
+    writeln!(
+        output,
+        "Register this callback URL in Notion: https://{hostname}{path}"
+    )
+    .and_then(|()| output.flush())
+    .map_err(|_| "cannot display the callback URL".to_owned())?;
+    let (sender, receiver) = oneshot::channel();
+    let state = HttpState {
+        expected_path: Arc::from(path),
+        callback_id,
+        store: store.clone(),
+        rotate,
+        result: Arc::new(Mutex::new(Some(sender))),
+    };
+    let app = Router::new().fallback(any(endpoint)).with_state(state);
+    let verification = async move {
+        receiver
+            .await
+            .map_err(|_| "enrollment listener stopped before verification".to_owned())?
+    };
+    tokio::pin!(verification);
+    let verification_token = run_bounded(listener, app, &mut verification).await?;
+    Ok(format!(
+        "Notion webhook verification token: {verification_token}"
+    ))
+}
+
+async fn endpoint(State(state): State<HttpState>, request: Request) -> Response {
+    if request.uri().path() != state.expected_path.as_ref() {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    }
+    if request.method() != Method::POST {
+        return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n").into_response();
+    }
+    if request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > MAX_BODY_BYTES)
+    {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n").into_response();
+    }
+    let body = match tokio::time::timeout(
+        BODY_READ_TIMEOUT,
+        to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Err(_) => return (StatusCode::REQUEST_TIMEOUT, "request timeout\n").into_response(),
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return (StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n").into_response();
+        }
+    };
+    let payload: VerificationPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(_) => return (StatusCode::BAD_REQUEST, "bad request\n").into_response(),
+    };
+    if payload.verification_token.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "bad request\n").into_response();
+    }
+    let mut result = state.result.lock().await;
+    let Some(sender) = result.take() else {
+        return (StatusCode::CONFLICT, "already enrolled\n").into_response();
+    };
+    let verification_token = payload.verification_token;
+    let persisted = state.store.persist(
+        &Enrollment {
+            callback_id: state.callback_id,
+            verification_token: verification_token.clone(),
+        },
+        state.rotate,
+    );
+    let status = if persisted.is_ok() {
+        StatusCode::OK
     } else {
-        "Notion webhook verification token enrolled".to_owned()
-    })
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let _ = sender.send(persisted.map(|()| verification_token));
+    (
+        status,
+        if status == StatusCode::OK {
+            "enrolled\n"
+        } else {
+            "enrollment failed\n"
+        },
+    )
+        .into_response()
+}
+
+async fn run_bounded<F>(
+    listener: TcpListener,
+    app: Router,
+    shutdown: &mut std::pin::Pin<&mut F>,
+) -> Result<String, String>
+where
+    F: std::future::Future<Output = Result<String, String>>,
+{
+    let permits = Arc::new(Semaphore::new(MAX_ACTIVE_CONNECTIONS));
+    let mut connections = JoinSet::new();
+    let outcome = loop {
+        tokio::select! {
+            result = &mut *shutdown => break result,
+            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+            accepted = listener.accept() => {
+                let (stream, _) = accepted.map_err(|_| "cannot accept enrollment connection".to_owned())?;
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else { drop(stream); continue; };
+                let service = TowerToHyperService::new(app.clone());
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let mut builder = http1::Builder::new();
+                    builder.keep_alive(false);
+                    let connection = builder.serve_connection(TokioIo::new(stream), service);
+                    let _ = tokio::time::timeout(CONNECTION_DEADLINE, connection).await;
+                });
+            }
+        }
+    };
+    while connections.join_next().await.is_some() {}
+    outcome
+}
+
+fn validate_hostname(hostname: &str) -> Result<(), String> {
+    let valid = !hostname.is_empty()
+        && hostname.len() <= 253
+        && !hostname.starts_with('.')
+        && !hostname.ends_with('.')
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err("hostname is invalid".to_owned())
+    }
 }
 
 fn inspect_destination(path: &Path, rotate: bool) -> Result<(), String> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "refusing unsafe webhook token path {}: symbolic links are not allowed",
-            path.display()
-        )),
-        Ok(metadata) if !metadata.is_file() => Err(format!(
-            "refusing unsafe webhook token path {}: expected a regular file",
-            path.display()
-        )),
-        Ok(metadata) if metadata.mode() & 0o777 != 0o600 => Err(format!(
-            "webhook token file {} must have mode 0600 before rotation",
-            path.display()
-        )),
-        Ok(_) if !rotate => Err(
-            "a Notion webhook verification token is already enrolled; use --rotate to replace it"
-                .to_owned(),
-        ),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err("refusing unsafe private webhook enrollment path".to_owned())
+        }
+        Ok(metadata) if metadata.mode() & 0o777 != 0o600 => {
+            Err("private webhook enrollment file must have mode 0600".to_owned())
+        }
+        Ok(_) if !rotate => {
+            Err("a Notion webhook enrollment already exists; use --rotate to replace it".to_owned())
+        }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!(
-            "cannot inspect webhook token file {}: {error}",
-            path.display()
-        )),
+        Err(_) => Err("cannot inspect private webhook enrollment".to_owned()),
     }
 }
 
+fn read_private_file(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "no Notion webhook enrollment exists; run webhook-enroll first".to_owned()
+            } else {
+                "cannot safely open private webhook enrollment".to_owned()
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot inspect private webhook enrollment".to_owned())?;
+    if !metadata.is_file() || metadata.mode() & 0o777 != 0o600 {
+        return Err("private webhook enrollment must be a mode 0600 regular file".to_owned());
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| "cannot read private webhook enrollment".to_owned())?;
+    Ok(bytes)
+}
+
 fn temporary_path(directory: &Path) -> PathBuf {
-    let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
     directory.join(format!(
-        ".notion-webhook-verification-token.tmp-{}-{sequence}",
-        std::process::id()
+        ".notion-webhook-enrollment.tmp-{}-{}",
+        std::process::id(),
+        NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed)
     ))
 }
 
-fn write_private_temporary_file(temporary: &Path, token: &str) -> Result<(), String> {
-    use std::io::Write;
-
+fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(temporary)
-        .map_err(|error| format!("cannot create private webhook token file: {error}"))?;
+        .open(path)
+        .map_err(|_| "cannot create private webhook enrollment".to_owned())?;
     file.set_permissions(fs::Permissions::from_mode(0o600))
-        .map_err(|error| format!("cannot secure private webhook token file: {error}"))?;
-    file.write_all(token.as_bytes())
-        .and_then(|_| file.sync_all())
-        .map_err(|error| format!("cannot persist webhook verification token: {error}"))?;
-    Ok(())
-}
-
-fn commit_temporary_file<O: CommitOperations>(
-    operations: &O,
-    temporary: &Path,
-    destination: &Path,
-    rotate: bool,
-) -> Result<(), String> {
-    if rotate {
-        operations
-            .rename(temporary, destination)
-            .map_err(|error| format!("cannot rotate webhook verification token: {error}"))?;
-    } else {
-        operations.hard_link(temporary, destination).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                "a Notion webhook verification token is already enrolled; use --rotate to replace it"
-                    .to_owned()
-            } else {
-                format!("cannot enroll webhook verification token: {error}")
-            }
-        })?;
-        let _ = operations.remove_file(temporary);
-    }
-    operations
-        .sync_directory(destination.parent().expect("token path has a parent"))
-        .map_err(|error| {
-            let action = if rotate { "replaced" } else { "installed" };
-            format!(
-                "webhook verification token was {action}, but durability confirmation failed: {error}"
-            )
-        })
+        .and_then(|()| file.write_all(bytes))
+        .and_then(|()| file.sync_all())
+        .map_err(|_| "cannot persist private webhook enrollment".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
-    use std::io;
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
-    #[derive(Default)]
-    struct FakeTokenStore {
-        writes: RefCell<Vec<(String, bool)>>,
-    }
-
-    impl TokenStore for FakeTokenStore {
-        fn persist(&self, token: &str, rotate: bool) -> Result<(), String> {
-            self.writes.borrow_mut().push((token.to_owned(), rotate));
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingOperations {
-        calls: RefCell<Vec<&'static str>>,
-        unlink_fails: bool,
-        sync_fails: bool,
-    }
-
-    impl CommitOperations for RecordingOperations {
-        fn hard_link(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("hard_link");
-            Ok(())
-        }
-
-        fn rename(&self, _source: &Path, _destination: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("rename");
-            Ok(())
-        }
-
-        fn remove_file(&self, _path: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("remove_file");
-            if self.unlink_fails {
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn sync_directory(&self, _path: &Path) -> io::Result<()> {
-            self.calls.borrow_mut().push("sync_directory");
-            if self.sync_fails {
-                Err(io::Error::other("injected"))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    enum Race {
-        CreateDestinationSymlink,
-        ReplaceDestinationWithSymlink,
-    }
-
-    struct RacingOperations {
-        race: Race,
-        target: PathBuf,
-    }
-
-    impl CommitOperations for RacingOperations {
-        fn hard_link(&self, source: &Path, destination: &Path) -> io::Result<()> {
-            assert!(matches!(self.race, Race::CreateDestinationSymlink));
-            symlink(&self.target, destination)?;
-            fs::hard_link(source, destination)
-        }
-
-        fn rename(&self, source: &Path, destination: &Path) -> io::Result<()> {
-            assert!(matches!(self.race, Race::ReplaceDestinationWithSymlink));
-            fs::remove_file(destination)?;
-            symlink(&self.target, destination)?;
-            fs::rename(source, destination)
-        }
-
-        fn remove_file(&self, path: &Path) -> io::Result<()> {
-            fs::remove_file(path)
-        }
-
-        fn sync_directory(&self, path: &Path) -> io::Result<()> {
-            fs::File::open(path)?.sync_all()
-        }
-    }
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn temporary_directory() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -331,328 +375,214 @@ mod tests {
         path
     }
 
-    #[test]
-    fn accepts_the_verification_payload_without_contacting_notion() {
-        let store = FakeTokenStore::default();
-        let message = enroll(
-            br#"{"verification_token":"verification-secret"}"#.as_slice(),
-            &store,
-            false,
+    fn state() -> (
+        HttpState,
+        oneshot::Receiver<Result<String, String>>,
+        PathBuf,
+    ) {
+        let (sender, receiver) = oneshot::channel();
+        let root = temporary_directory();
+        (
+            HttpState {
+                expected_path: Arc::from("/notion/webhook/00000000-0000-4000-8000-000000000000"),
+                callback_id: Uuid::nil(),
+                store: FileTokenStore::new(root.join("state")),
+                rotate: false,
+                result: Arc::new(Mutex::new(Some(sender))),
+            },
+            receiver,
+            root,
         )
-        .unwrap();
+    }
 
-        assert_eq!(message, "Notion webhook verification token enrolled");
-        assert_eq!(
-            store.writes.into_inner(),
-            vec![("verification-secret".to_owned(), false)]
-        );
+    fn request(method: Method, path: &str, body: &str) -> Request {
+        Request::builder()
+            .method(method)
+            .uri(path)
+            .body(axum::body::Body::from(body.to_owned()))
+            .unwrap()
     }
 
     #[test]
-    fn explicit_rotation_is_forwarded_without_echoing_the_token() {
-        let store = FakeTokenStore::default();
-        let message = enroll(
-            br#"{"verification_token":"replacement-secret"}"#.as_slice(),
-            &store,
-            true,
-        )
-        .unwrap();
-
-        assert_eq!(message, "Notion webhook verification token rotated");
-        assert!(!message.contains("replacement-secret"));
-        assert!(store.writes.borrow()[0].1);
-    }
-
-    #[test]
-    fn malformed_payload_diagnostics_do_not_echo_input() {
-        for input in [
-            br#"{"verification_token":"actual-secret","extra":true}"#.as_slice(),
-            br#"{"verification_token":42,"secret":"actual-secret"}"#.as_slice(),
-            br#"{"verification_token":""}"#.as_slice(),
+    fn accepts_only_plain_valid_hostnames() {
+        for hostname in ["example.com", "webhook.example.test", "localhost"] {
+            assert_eq!(validate_hostname(hostname), Ok(()));
+        }
+        for hostname in [
+            "",
+            "https://example.com",
+            "bad/path",
+            "-bad.example",
+            "bad..example",
         ] {
-            let error = enroll(input, &FakeTokenStore::default(), false).unwrap_err();
-            assert!(error.starts_with("invalid webhook verification payload"));
-            assert!(!error.contains("actual-secret"));
+            assert!(validate_hostname(hostname).is_err());
         }
     }
 
-    #[test]
-    fn first_enrollment_creates_a_private_token_file() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let store = FileTokenStore::new(state.clone());
-
-        enroll(
-            br#"{"verification_token":"first-secret"}"#.as_slice(),
-            &store,
-            false,
-        )
-        .unwrap();
-
-        let token_file = state.join(TOKEN_FILE);
-        assert_eq!(fs::read_to_string(&token_file).unwrap(), "first-secret");
-        assert_eq!(fs::metadata(&token_file).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(&state).unwrap().mode() & 0o777, 0o700);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn repeat_enrollment_refuses_to_overwrite_the_token() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let store = FileTokenStore::new(state.clone());
-        enroll(
-            br#"{"verification_token":"first"}"#.as_slice(),
-            &store,
-            false,
-        )
-        .unwrap();
-
-        let error = enroll(
-            br#"{"verification_token":"second-secret"}"#.as_slice(),
-            &store,
-            false,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("already enrolled"));
-        assert!(!error.contains("second-secret"));
-        assert_eq!(fs::read_to_string(state.join(TOKEN_FILE)).unwrap(), "first");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn explicit_rotation_atomically_replaces_the_token() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let store = FileTokenStore::new(state.clone());
-        enroll(
-            br#"{"verification_token":"first"}"#.as_slice(),
-            &store,
-            false,
-        )
-        .unwrap();
-
-        enroll(
-            br#"{"verification_token":"second"}"#.as_slice(),
-            &store,
-            true,
-        )
-        .unwrap();
-
-        let token_file = state.join(TOKEN_FILE);
-        assert_eq!(fs::read_to_string(&token_file).unwrap(), "second");
-        assert_eq!(fs::metadata(token_file).unwrap().mode() & 0o777, 0o600);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn loads_an_enrolled_private_token_without_exposing_it() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let store = FileTokenStore::new(state);
-        store.persist("enrolled-secret", false).unwrap();
-
-        assert_eq!(store.load().unwrap(), "enrolled-secret");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn loading_refuses_unsafe_or_missing_token_files_with_secret_safe_errors() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let store = FileTokenStore::new(state.clone());
-        assert!(store.load().unwrap_err().contains("webhook-enroll"));
-
-        let token_file = state.join(TOKEN_FILE);
-        fs::write(&token_file, "actual-secret").unwrap();
-        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o644)).unwrap();
-        let error = store.load().unwrap_err();
-        assert!(error.contains("mode 0600"));
-        assert!(!error.contains("actual-secret"));
-
-        fs::remove_file(&token_file).unwrap();
-        let target = root.join("target");
-        fs::write(&target, "target-secret").unwrap();
-        symlink(&target, &token_file).unwrap();
-        let error = store.load().unwrap_err();
-        assert!(error.contains("cannot safely open"));
-        assert!(!error.contains("target-secret"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn refuses_symbolic_link_token_files_without_changing_the_target() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        crate::config::ensure_private_directory(&state).unwrap();
-        let target = root.join("outside");
-        fs::write(&target, "unchanged").unwrap();
-        symlink(&target, state.join(TOKEN_FILE)).unwrap();
-        let store = FileTokenStore::new(state);
-
-        let error = enroll(
-            br#"{"verification_token":"actual-secret"}"#.as_slice(),
-            &store,
-            true,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("symbolic links are not allowed"));
-        assert!(!error.contains("actual-secret"));
-        assert_eq!(fs::read_to_string(target).unwrap(), "unchanged");
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rotation_refuses_an_existing_file_with_unsafe_permissions() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        crate::config::ensure_private_directory(&state).unwrap();
-        let token_file = state.join(TOKEN_FILE);
-        fs::write(&token_file, "existing-secret").unwrap();
-        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o644)).unwrap();
-        let store = FileTokenStore::new(state);
-
-        let error = enroll(
-            br#"{"verification_token":"replacement-secret"}"#.as_slice(),
-            &store,
-            true,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("must have mode 0600"));
-        assert!(!error.contains("existing-secret"));
-        assert!(!error.contains("replacement-secret"));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn cleanup_failure_after_first_enrollment_does_not_report_a_false_failure() {
-        let operations = RecordingOperations {
-            unlink_fails: true,
-            ..RecordingOperations::default()
-        };
-
-        let result = commit_temporary_file(
-            &operations,
-            Path::new("/state/temp"),
-            Path::new("/state/token"),
-            false,
-        );
-
-        assert_eq!(result, Ok(()));
+    #[tokio::test]
+    async fn only_the_exact_path_and_post_method_can_enroll() {
+        let (state, mut receiver, root) = state();
         assert_eq!(
-            operations.calls.into_inner(),
-            vec!["hard_link", "remove_file", "sync_directory"]
+            endpoint(
+                State(state.clone()),
+                request(
+                    Method::POST,
+                    "/notion/webhook",
+                    r#"{"verification_token":"secret"}"#
+                )
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
         );
-    }
-
-    #[test]
-    fn enrollment_sync_failure_reports_that_the_token_was_installed() {
-        let operations = RecordingOperations {
-            sync_fails: true,
-            ..RecordingOperations::default()
-        };
-
-        let error = commit_temporary_file(
-            &operations,
-            Path::new("/state/temp"),
-            Path::new("/state/token"),
-            false,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("token was installed"));
-        assert!(error.contains("durability confirmation failed"));
         assert_eq!(
-            operations.calls.into_inner(),
-            vec!["hard_link", "remove_file", "sync_directory"]
+            endpoint(
+                State(state.clone()),
+                request(Method::GET, state.expected_path.as_ref(), "")
+            )
+            .await
+            .status(),
+            StatusCode::METHOD_NOT_ALLOWED
         );
+        assert!(receiver.try_recv().is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn rotation_sync_failure_reports_that_the_token_was_replaced() {
-        let operations = RecordingOperations {
-            sync_fails: true,
-            ..RecordingOperations::default()
-        };
-
-        let error = commit_temporary_file(
-            &operations,
-            Path::new("/state/temp"),
-            Path::new("/state/token"),
-            true,
+    #[tokio::test]
+    async fn valid_payload_is_accepted_without_echoing_the_token() {
+        let (state, receiver, root) = state();
+        let response = endpoint(
+            State(state.clone()),
+            request(
+                Method::POST,
+                state.expected_path.as_ref(),
+                r#"{"verification_token":"secret"}"#,
+            ),
         )
-        .unwrap_err();
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(receiver.await.unwrap().unwrap(), "secret");
+        assert_eq!(state.store.load().unwrap(), "secret");
+        fs::remove_dir_all(root).unwrap();
+    }
 
-        assert!(error.contains("token was replaced"));
-        assert!(error.contains("durability confirmation failed"));
+    #[tokio::test]
+    async fn malformed_and_declared_oversized_payloads_are_rejected() {
+        let (state, _, root) = state();
         assert_eq!(
-            operations.calls.into_inner(),
-            vec!["rename", "sync_directory"]
+            endpoint(
+                State(state.clone()),
+                request(Method::POST, state.expected_path.as_ref(), "not json")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        fs::remove_dir_all(root).unwrap();
+        let oversized = Request::builder()
+            .method(Method::POST)
+            .uri(state.expected_path.as_ref())
+            .header("content-length", MAX_BODY_BYTES + 1)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            endpoint(State(state), oversized).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
         );
     }
 
     #[test]
-    fn first_enrollment_does_not_clobber_a_destination_created_after_inspection() {
+    fn enrollment_pair_is_private_and_rotation_replaces_it_together() {
         let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        let target = root.join("race-target");
-        fs::write(&target, "race-winner").unwrap();
-        let operations = RacingOperations {
-            race: Race::CreateDestinationSymlink,
-            target: target.clone(),
+        let store = FileTokenStore::new(root.join("state/agent-handover"));
+        let first = Enrollment {
+            callback_id: Uuid::new_v4(),
+            verification_token: "first".to_owned(),
         };
-        let store = FileTokenStore::new(state.clone());
+        store.persist(&first, false).unwrap();
+        let path = store.destination();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(store.load().unwrap(), "first");
 
         let error = store
-            .persist_with_operations("new-secret", false, &operations)
+            .persist(
+                &Enrollment {
+                    callback_id: Uuid::new_v4(),
+                    verification_token: "refused-secret".to_owned(),
+                },
+                false,
+            )
             .unwrap_err();
+        assert!(error.contains("already exists"));
+        assert!(!error.contains("refused-secret"));
+        assert_eq!(store.load().unwrap(), "first");
 
-        assert!(error.contains("already enrolled"));
-        assert!(!error.contains("new-secret"));
-        assert!(
-            fs::symlink_metadata(state.join(TOKEN_FILE))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_to_string(target).unwrap(), "race-winner");
+        let second = Enrollment {
+            callback_id: Uuid::new_v4(),
+            verification_token: "second".to_owned(),
+        };
+        store.persist(&second, true).unwrap();
+        let saved: Enrollment = serde_json::from_slice(&read_private_file(&path).unwrap()).unwrap();
+        assert_eq!(saved.callback_id, second.callback_id);
+        assert_eq!(saved.verification_token, "second");
         fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn rotation_replaces_a_symlink_raced_into_the_destination_not_its_target() {
-        let root = temporary_directory();
-        let state = root.join("state/agent-handover");
-        crate::config::ensure_private_directory(&state).unwrap();
-        let token_file = state.join(TOKEN_FILE);
-        fs::write(&token_file, "existing").unwrap();
-        fs::set_permissions(&token_file, fs::Permissions::from_mode(0o600)).unwrap();
-        let target = root.join("race-target");
-        fs::write(&target, "untouched").unwrap();
-        let operations = RacingOperations {
-            race: Race::ReplaceDestinationWithSymlink,
-            target: target.clone(),
+    #[tokio::test]
+    async fn occupied_enrollment_port_fails_without_disclosing_private_values() {
+        let Ok(_listener) = TcpListener::bind(ENROLLMENT_ADDRESS).await else {
+            return;
         };
-        let store = FileTokenStore::new(state);
+        let root = temporary_directory();
+        let store = FileTokenStore::new(root.join("private/state"));
+        let error = enroll("private.example.test", &store, false, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(error.contains("port 8080 may be occupied"));
+        assert!(!error.contains("private.example.test"));
+        assert!(!error.contains(root.to_string_lossy().as_ref()));
+        fs::remove_dir_all(root).unwrap();
+    }
 
-        store
-            .persist_with_operations("replacement-secret", true, &operations)
-            .unwrap();
-
+    #[tokio::test]
+    async fn loopback_flow_prints_exact_url_persists_then_exits() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = temporary_directory();
+        let store = FileTokenStore::new(root.join("state"));
+        let callback_id = Uuid::parse_str("00000000-0000-4000-8000-000000000070").unwrap();
+        let mut output = Vec::new();
+        let enrollment = enroll_with_listener(
+            "handover.example.test",
+            callback_id,
+            listener,
+            &store,
+            false,
+            &mut output,
+        );
+        let client = async {
+            tokio::task::yield_now().await;
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let body = r#"{"verification_token":"one-time-secret"}"#;
+            let request = format!(
+                "POST /notion/webhook/{callback_id} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        };
+        let (result, ()) = tokio::join!(enrollment, client);
+        assert!(result.unwrap().contains("one-time-secret"));
+        assert_eq!(store.load().unwrap(), "one-time-secret");
         assert_eq!(
-            fs::read_to_string(&token_file).unwrap(),
-            "replacement-secret"
+            String::from_utf8(output).unwrap(),
+            "Register this callback URL in Notion: https://handover.example.test/notion/webhook/00000000-0000-4000-8000-000000000070\n"
         );
-        assert!(
-            !fs::symlink_metadata(token_file)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read_to_string(target).unwrap(), "untouched");
         fs::remove_dir_all(root).unwrap();
     }
 }

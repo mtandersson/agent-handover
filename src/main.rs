@@ -14,14 +14,14 @@ mod reconciliation;
 mod serving;
 mod state;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
     Serve,
     RunOnce,
-    WebhookEnroll { rotate: bool },
+    WebhookEnroll { hostname: String, rotate: bool },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Invocation {
     Command(Command),
     Help,
@@ -34,13 +34,19 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
         [flag] if flag == "--help" || flag == "-h" => Ok(Invocation::Help),
         [command] if command == "serve" => Ok(Invocation::Command(Command::Serve)),
         [command] if command == "run-once" => Ok(Invocation::Command(Command::RunOnce)),
-        [command] if command == "webhook-enroll" => {
+        [command, flag, hostname] if command == "webhook-enroll" && flag == "--hostname" => {
             Ok(Invocation::Command(Command::WebhookEnroll {
+                hostname: hostname.clone(),
                 rotate: false,
             }))
         }
-        [command, flag] if command == "webhook-enroll" && flag == "--rotate" => {
-            Ok(Invocation::Command(Command::WebhookEnroll { rotate: true }))
+        [command, flag, hostname, rotate]
+            if command == "webhook-enroll" && flag == "--hostname" && rotate == "--rotate" =>
+        {
+            Ok(Invocation::Command(Command::WebhookEnroll {
+                hostname: hostname.clone(),
+                rotate: true,
+            }))
         }
         [flag] if flag == "--version" || flag == "-V" => Ok(Invocation::Version),
         _ => Err(usage()),
@@ -48,7 +54,7 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
 }
 
 fn usage() -> String {
-    "usage: agent-handover [--help | --version | serve | run-once | webhook-enroll [--rotate]]\n\
+    "usage: agent-handover [--help | --version | serve | run-once | webhook-enroll --hostname <HOST> [--rotate]]\n\
      Run `agent-handover --help` for setup and command guidance."
         .to_owned()
 }
@@ -77,10 +83,10 @@ Commands:
       Requires the host configuration. It does not require a webhook token or
       public tunnel.
 
-  webhook-enroll [--rotate]
-      Read a Notion webhook verification JSON payload from standard input and
-      store its token privately. Use --rotate only to replace an enrolled token.
-      Requires the host configuration.
+  webhook-enroll --hostname <HOST> [--rotate]
+      Generate a secret callback URL, listen for one Notion verification POST
+      on 127.0.0.1:8080, and store the callback ID and token privately. No host
+      configuration is required.
 
   serve
       Reconcile Pending tasks at startup, then keep reconciling while serving
@@ -91,7 +97,7 @@ Commands:
 
 Examples:
   agent-handover run-once
-  printf '%s\n' '{"verification_token":"<TOKEN>"}' | agent-handover webhook-enroll
+  agent-handover webhook-enroll --hostname handover.example.com
   agent-handover serve
 
 Use --version to print the installed version."#
@@ -106,13 +112,22 @@ fn main() -> ExitCode {
     let args = env::args().skip(1).collect::<Vec<_>>();
 
     let result = match parse_command(&args) {
-        Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {
-            config::load(&paths).and_then(|config| match command {
-                Command::WebhookEnroll { rotate } => enrollment::enroll(
-                    io::stdin().lock(),
+        Ok(Invocation::Command(Command::WebhookEnroll { hostname, rotate })) => {
+            config::HostPaths::discover().and_then(|paths| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| "cannot initialize webhook enrollment runtime".to_owned())?;
+                runtime.block_on(enrollment::enroll(
+                    &hostname,
                     &enrollment::FileTokenStore::new(paths.state_directory),
                     rotate,
-                ),
+                    &mut io::stdout().lock(),
+                ))
+            })
+        }
+        Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {
+            config::load(&paths).and_then(|config| match command {
                 Command::Serve => notion::NotionHttpClient::new(
                     &config.notion,
                     &config.task_properties,
@@ -163,6 +178,7 @@ fn main() -> ExitCode {
                     })?;
                     Ok(run_once_response(count))
                 }),
+                Command::WebhookEnroll { .. } => unreachable!("enrollment handled without config"),
             })
         }),
         Ok(Invocation::Help) => Ok(help()),
@@ -189,7 +205,7 @@ mod tests {
     #[test]
     fn shows_help_without_arguments_or_with_help_flags() {
         assert!(help().contains("Before you begin:"));
-        assert!(help().contains("webhook-enroll [--rotate]"));
+        assert!(help().contains("webhook-enroll --hostname <HOST> [--rotate]"));
         assert_eq!(parse_command(&[]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["--help".to_owned()]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["-h".to_owned()]), Ok(Invocation::Help));
@@ -215,14 +231,27 @@ mod tests {
             Ok(Invocation::Command(Command::RunOnce))
         );
         assert_eq!(
-            parse_command(&["webhook-enroll".to_owned()]),
+            parse_command(&[
+                "webhook-enroll".to_owned(),
+                "--hostname".to_owned(),
+                "example.test".to_owned()
+            ]),
             Ok(Invocation::Command(Command::WebhookEnroll {
+                hostname: "example.test".to_owned(),
                 rotate: false
             }))
         );
         assert_eq!(
-            parse_command(&["webhook-enroll".to_owned(), "--rotate".to_owned()]),
-            Ok(Invocation::Command(Command::WebhookEnroll { rotate: true }))
+            parse_command(&[
+                "webhook-enroll".to_owned(),
+                "--hostname".to_owned(),
+                "example.test".to_owned(),
+                "--rotate".to_owned()
+            ]),
+            Ok(Invocation::Command(Command::WebhookEnroll {
+                hostname: "example.test".to_owned(),
+                rotate: true
+            }))
         );
     }
 
