@@ -119,8 +119,11 @@ not put them in this repository.
 
 ### Connection webhook
 
-The `webhook-enroll` command captures Notion's one-time verification token with
-overwrite protection. Subsequent webhook requests will be authenticated
+The `webhook-enroll --hostname <HOST>` command generates a random UUID callback
+path, listens on `127.0.0.1:8080`, and captures Notion's one-time verification
+token with overwrite protection. It works before `config.toml` exists and
+validates the hostname locally without resolving it. Subsequent webhook
+requests will be authenticated
 from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
 signals: they can be delayed, duplicated, or delivered out of order, as
 described by [Notion's event-delivery contract][notion-delivery], so the runner
@@ -279,10 +282,11 @@ Operational state, verification tokens, prompts, agent output, run records, and
 host-specific paths must never be committed. Configuration diagnostics and
 normal logs omit the Notion token and data source IDs.
 
-The webhook verification token is stored at
-`$XDG_STATE_HOME/agent-handover/notion-webhook-verification-token`, falling back
-to `$HOME/.local/state/agent-handover`. The file is created atomically with mode
-`0600`; symbolic links and unsafe existing files are refused.
+The callback UUID and webhook verification token are stored together at
+`$XDG_STATE_HOME/agent-handover/notion-webhook-enrollment.json`, falling back to
+`$HOME/.local/state/agent-handover`. The file is created atomically with mode
+`0600`; symbolic links and unsafe existing files are refused. Rotation replaces
+the pair in one rename, so the values cannot come from different enrollments.
 
 ## Commands
 
@@ -303,8 +307,8 @@ The runner interface is:
 | --- | --- |
 | `agent-handover serve` | Reconcile Pending tasks at startup, then serve health and authenticated webhook routes while repeating reconciliation at the configured interval; all eligible discoveries execute sequentially |
 | `agent-handover run-once` | Query and authoritatively validate current Pending tasks once, execute them sequentially, and wait for the complete drain |
-| `agent-handover webhook-enroll` | Read a Notion verification payload from standard input and enroll its token without overwriting an existing token |
-| `agent-handover webhook-enroll --rotate` | Deliberately replace an existing verification token |
+| `agent-handover webhook-enroll --hostname <HOST>` | Generate and display the exact secret callback URL, then receive one verification POST on loopback |
+| `agent-handover webhook-enroll --hostname <HOST> --rotate` | Atomically replace an existing callback UUID and verification token |
 
 Unsupported or incomplete configuration will fail with actionable errors that
 do not reveal secrets.
@@ -316,20 +320,18 @@ tunnel and webhook subscription described above. Both commands only run tasks
 whose current `Status` is `Pending`, and send the recursively rendered task
 page body to Codex as its instruction source.
 
-Enrollment is non-interactive and accepts the JSON payload on standard input,
-keeping the token out of command arguments and normal output:
+Enrollment prints the exact public callback URL to register in Notion, then
+waits for the one-time verification POST routed to local port 8080:
 
 ```sh
-printf '%s\n' '{"verification_token":"<VERIFICATION_TOKEN>"}' \
-  | agent-handover webhook-enroll
+agent-handover webhook-enroll --hostname handover.example.com
 ```
 
 Repeat enrollment is refused. Use `--rotate` only when deliberately replacing
 the enrolled token:
 
 ```sh
-printf '%s\n' '{"verification_token":"<REPLACEMENT_TOKEN>"}' \
-  | agent-handover webhook-enroll --rotate
+agent-handover webhook-enroll --hostname handover.example.com --rotate
 ```
 
 ## Task lifecycle and safety
