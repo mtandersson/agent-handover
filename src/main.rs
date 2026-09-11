@@ -86,14 +86,24 @@ Commands:
   webhook-enroll --hostname <HOST> [--rotate]
       Generate a secret callback URL, listen for one Notion verification POST
       on 127.0.0.1:8080, and store the callback ID and token privately. No host
-      configuration is required.
+      configuration is required. HOST must be a plain DNS hostname; it is
+      validated locally without a network lookup. The command prints the exact
+      HTTPS URL, Notion setup links, required events, API version, verification
+      steps, and externally managed tunnel guidance before it waits.
+
+      Repeat enrollment is refused. Use --rotate to generate a replacement URL
+      and atomically replace the callback ID and token after Notion verifies it.
+      Delete and recreate the Notion subscription because a verified URL cannot
+      be changed.
 
   serve
       Reconcile Pending tasks at startup, then keep reconciling while serving
       authenticated webhooks and health checks. Tasks execute sequentially.
       Requires the host configuration and an enrolled webhook token. To receive
       Notion events, route a public HTTPS webhook subscription to the configured
-      loopback webhook path through an externally managed tunnel.
+      secret loopback webhook path through an externally managed tunnel. Unlike
+      the one-time enrollment request, serve requires X-Notion-Signature
+      authentication over the unmodified body.
 
 Examples:
   agent-handover run-once
@@ -204,8 +214,13 @@ mod tests {
 
     #[test]
     fn shows_help_without_arguments_or_with_help_flags() {
-        assert!(help().contains("Before you begin:"));
-        assert!(help().contains("webhook-enroll --hostname <HOST> [--rotate]"));
+        let help = help();
+        assert!(help.contains("Before you begin:"));
+        assert!(help.contains("webhook-enroll --hostname <HOST> [--rotate]"));
+        assert!(help.contains("plain DNS hostname"));
+        assert!(help.contains("externally managed tunnel guidance"));
+        assert!(help.contains("Delete and recreate the Notion subscription"));
+        assert!(help.contains("serve requires X-Notion-Signature"));
         assert_eq!(parse_command(&[]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["--help".to_owned()]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["-h".to_owned()]), Ok(Invocation::Help));

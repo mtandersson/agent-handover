@@ -119,11 +119,43 @@ not put them in this repository.
 
 ### Connection webhook
 
-The `webhook-enroll --hostname <HOST>` command generates a random UUID callback
-path, listens on `127.0.0.1:8080`, and captures Notion's one-time verification
-token with overwrite protection. It works before `config.toml` exists and
-validates the hostname locally without resolving it. Subsequent webhook
-requests will be authenticated
+Create the connection and share the task and journal data sources before
+enrollment. Then complete the webhook subscription as follows:
+
+1. Arrange an externally managed tunnel from the public HTTPS hostname to
+   `http://127.0.0.1:8080`. The tunnel must route only the secret callback path
+   printed in the next step; the [Cloudflare example](#external-tunnel) can be
+   filled in once the UUID is known.
+2. Run `agent-handover webhook-enroll --hostname handover.example.com`, using
+   only the public DNS hostname (without a scheme, port, path, or credentials).
+   The command validates the hostname locally without resolving it and does not
+   require `config.toml`.
+3. Keep the command running. It generates a random UUID and prints the exact
+   `https://<HOST>/notion/webhook/<UUID>` URL, plus links to
+   [Notion Connections][notion-connections] and the [webhook setup
+   guide][notion-webhooks]. Nothing is persisted until verification succeeds.
+4. In the connection's **Webhooks** tab, create a subscription using that exact
+   URL, Notion API version `2026-03-11`, and these event types:
+
+   - `page.created`
+   - `page.content_updated`
+   - `page.properties_updated`
+
+5. Notion sends one unsigned verification POST to the local enrollment
+   listener through the tunnel. The command accepts one bounded request only at
+   the exact UUID-bearing path, atomically stores the callback UUID and token,
+   prints the token once, and exits.
+6. Back in Notion, choose **Verify**, paste the printed token, and activate the
+   subscription. Start `agent-handover serve` only after verification and keep
+   the external tunnel running beside it.
+
+Repeat enrollment is refused. To replace an enrollment, delete the verified
+Notion subscription (Notion does not allow its URL to be changed), run
+`webhook-enroll --hostname <HOST> --rotate`, update the tunnel route to the new
+printed path, and create and verify a new subscription. The old UUID and token
+remain paired until the replacement verification succeeds.
+
+Normal webhook requests are authenticated
 from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
 signals: they can be delayed, duplicated, or delivered out of order, as
 described by [Notion's event-delivery contract][notion-delivery], so the runner
@@ -183,9 +215,15 @@ supervisors. Duplicate deliveries subscribe to their existing supervisor
 without consuming another slot, while excess unique events wait without
 claiming event or page state.
 
-Notion requires a public HTTPS webhook URL. A [locally managed Cloudflare
-Tunnel][cloudflare-tunnel] can route only the webhook path to the loopback-bound
-runner; use placeholders, not real host values, when adapting this example:
+#### External tunnel
+
+Notion requires a public HTTPS webhook URL and cannot reach localhost. Tunnel
+provisioning, DNS, credentials, configuration, and process supervision remain
+external to `agent-handover`. For example, a [locally managed Cloudflare
+Tunnel][cloudflare-tunnel] can route only the generated callback path to the
+loopback-bound runner. Supply the existing tunnel's UUID and credentials, and
+replace `<CALLBACK_UUID>` with the value shown by `webhook-enroll`; never commit
+the resulting private configuration:
 
 ```yaml
 tunnel: <TUNNEL_UUID>
@@ -193,14 +231,18 @@ credentials-file: /path/to/<TUNNEL_UUID>.json
 
 ingress:
   - hostname: handover.example.com
-    path: /notion/webhook/<CALLBACK_UUID>
+    path: ^/notion/webhook/<CALLBACK_UUID>$
     service: http://127.0.0.1:<PORT>
   - service: http_status:404
 ```
 
-The final catch-all rule is required by `cloudflared`. Provision and protect the
-tunnel separately, then configure the resulting HTTPS URL in the Notion
-connection's webhook subscription.
+The `path` value is an anchored regular expression so it matches only the
+generated endpoint. The `<PORT>` must match the listener (currently `8080`).
+The final catch-all rule prevents the tunnel from exposing other local routes
+and is required by `cloudflared`. Start the connector before creating the
+Notion subscription and keep it running with `serve`. Cloudflare Tunnel is one
+option; any externally managed tunnel is acceptable if it preserves the exact
+public path and forwards the unmodified body and `X-Notion-Signature` header.
 
 ## Private host configuration
 
@@ -511,5 +553,6 @@ Licensed under the [MIT License](LICENSE).
 [codex-exec]: https://developers.openai.com/codex/noninteractive
 [notion-automations]: https://www.notion.com/help/database-automations
 [notion-delivery]: https://developers.notion.com/reference/webhooks-events-delivery
+[notion-connections]: https://app.notion.com/developers/connections
 [notion-webhooks]: https://developers.notion.com/reference/webhooks
 [notion-blocks]: https://developers.notion.com/reference/block
