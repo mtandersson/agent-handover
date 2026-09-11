@@ -35,6 +35,9 @@ const MAX_BODY_BYTES: usize = 1024 * 1024;
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
 const MAX_ACTIVE_CONNECTIONS: usize = 16;
+const NOTION_API_VERSION: &str = "2026-03-11";
+const NOTION_CONNECTIONS_URL: &str = "https://app.notion.com/developers/connections";
+const NOTION_WEBHOOKS_URL: &str = "https://developers.notion.com/reference/webhooks";
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
@@ -164,12 +167,9 @@ async fn enroll_with_listener<W: Write>(
     output: &mut W,
 ) -> Result<String, String> {
     let path = format!("{WEBHOOK_BASE_PATH}/{callback_id}");
-    writeln!(
-        output,
-        "Register this callback URL in Notion: https://{hostname}{path}"
-    )
-    .and_then(|()| output.flush())
-    .map_err(|_| "cannot display the callback URL".to_owned())?;
+    write!(output, "{}", enrollment_guidance(hostname, &path))
+        .and_then(|()| output.flush())
+        .map_err(|_| "cannot display webhook enrollment guidance".to_owned())?;
     let (sender, receiver) = oneshot::channel();
     let state = HttpState {
         expected_path: Arc::from(path),
@@ -189,6 +189,32 @@ async fn enroll_with_listener<W: Write>(
     Ok(format!(
         "Notion webhook verification token: {verification_token}"
     ))
+}
+
+fn enrollment_guidance(hostname: &str, path: &str) -> String {
+    let callback_url = format!("https://{hostname}{path}");
+    format!(
+        "Notion webhook enrollment\n\
+         \n\
+         Keep this command running while Notion verifies the subscription.\n\
+         \n\
+         1. Expose only this callback through an externally managed HTTPS tunnel:\n\
+            {callback_url}\n\
+            Forward {path} to http://127.0.0.1:8080.\n\
+         2. Open Notion Connections: {NOTION_CONNECTIONS_URL}\n\
+            Select the connection, open Webhooks, and create a subscription.\n\
+            Setup guide: {NOTION_WEBHOOKS_URL}\n\
+         3. Use the exact callback URL above and subscribe to:\n\
+            - page.created\n\
+            - page.content_updated\n\
+            - page.properties_updated\n\
+            Notion API version: {NOTION_API_VERSION}\n\
+         4. Create the subscription. Notion sends one unsigned verification POST;\n\
+            this command stores its token privately and prints it once.\n\
+         5. In Notion, choose Verify, paste the printed token, and activate the\n\
+            subscription. Normal serve requests must also carry a valid\n\
+            X-Notion-Signature; the secret path does not replace authentication.\n"
+    )
 }
 
 async fn endpoint(State(state): State<HttpState>, request: Request) -> Response {
@@ -625,10 +651,19 @@ mod tests {
             saved.webhook_path(),
             format!("/notion/webhook/{callback_id}")
         );
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "Register this callback URL in Notion: https://handover.example.test/notion/webhook/00000000-0000-4000-8000-000000000070\n"
-        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains(
+            "https://handover.example.test/notion/webhook/00000000-0000-4000-8000-000000000070"
+        ));
+        assert!(output.contains("https://app.notion.com/developers/connections"));
+        assert!(output.contains("https://developers.notion.com/reference/webhooks"));
+        assert!(output.contains("page.created"));
+        assert!(output.contains("page.content_updated"));
+        assert!(output.contains("page.properties_updated"));
+        assert!(output.contains("Notion API version: 2026-03-11"));
+        assert!(output.contains("externally managed HTTPS tunnel"));
+        assert!(output.contains("choose Verify, paste the printed token"));
+        assert!(output.contains("X-Notion-Signature"));
         fs::remove_dir_all(root).unwrap();
     }
 }
