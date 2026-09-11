@@ -710,6 +710,9 @@ fn validate(config: &Config) -> Result<(), String> {
     }
     validate_endpoint_path("runner.webhook_path", &config.runner.webhook_path)?;
     validate_endpoint_path("runner.health_path", &config.runner.health_path)?;
+    if config.runner.webhook_path != crate::enrollment::WEBHOOK_BASE_PATH {
+        return Err("configuration field runner.webhook_path must be /notion/webhook".to_owned());
+    }
     if config.runner.webhook_path == config.runner.health_path {
         return Err("runner.webhook_path and runner.health_path must be distinct".to_owned());
     }
@@ -1248,6 +1251,21 @@ health_path = "/health"
         assert_eq!(
             load(&paths).unwrap_err(),
             "runner.bind_address must be a loopback address"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn webhook_base_path_matches_the_config_independent_enrollment_route() {
+        let root = temporary_directory();
+        let contents = fixture().replace(
+            "webhook_path = \"/notion/webhook\"",
+            "webhook_path = \"/custom/webhook\"",
+        );
+        let paths = write_fixture(&root, &contents, 0o600);
+        assert_eq!(
+            load(&paths).unwrap_err(),
+            "configuration field runner.webhook_path must be /notion/webhook"
         );
         fs::remove_dir_all(root).unwrap();
     }

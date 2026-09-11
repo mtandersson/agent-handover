@@ -193,7 +193,7 @@ credentials-file: /path/to/<TUNNEL_UUID>.json
 
 ingress:
   - hostname: handover.example.com
-    path: /notion/webhook
+    path: /notion/webhook/<CALLBACK_UUID>
     service: http://127.0.0.1:<PORT>
   - service: http_status:404
 ```
@@ -265,7 +265,10 @@ Supported sandbox values are `read-only`, `workspace-write`, and
 `danger-full-access`; the runner passes the configured policy through without
 weakening it. The required `[codex]` table is the private executor selection for
 this one-executor host profile. The bind address must include a port and use an
-IPv4 or IPv6 loopback address. Property names and lifecycle values must be
+IPv4 or IPv6 loopback address. `runner.webhook_path` must remain
+`/notion/webhook`, matching enrollment; `serve` appends the privately enrolled
+callback UUID and accepts webhook work only at that exact resulting path.
+Property names and lifecycle values must be
 non-empty and distinct, the Codex working directory must be absolute, durations
 must be positive, and the environment list accepts variable names only—not
 values.
@@ -315,7 +318,8 @@ do not reveal secrets.
 
 `run-once` requires the private host configuration but does not need an
 enrolled webhook token or public tunnel. `serve` requires the same configuration
-and an enrolled token; public Notion delivery additionally requires the HTTPS
+and a complete enrollment containing both the callback UUID and token; public
+Notion delivery additionally requires the HTTPS
 tunnel and webhook subscription described above. Both commands only run tasks
 whose current `Status` is `Pending`, and send the recursively rendered task
 page body to Codex as its instruction source.
@@ -328,7 +332,7 @@ agent-handover webhook-enroll --hostname handover.example.com
 ```
 
 Repeat enrollment is refused. Use `--rotate` only when deliberately replacing
-the enrolled token:
+the enrolled callback UUID and token:
 
 ```sh
 agent-handover webhook-enroll --hostname handover.example.com --rotate
