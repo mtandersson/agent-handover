@@ -1,7 +1,7 @@
 use crate::config::{Config, NotionConfig, TaskValues};
 use crate::coordination::{PreparationSink, RevisionCoordinator};
 use crate::discovery::NotionEventDispatcher;
-use crate::enrollment::TokenSource;
+use crate::enrollment::EnrollmentSource;
 use crate::http;
 use crate::notion::{NotionAdapter, NotionHttpClient};
 use crate::orchestration::ExecutionWorkflow;
@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-pub(crate) fn serve<T: TokenSource>(
+pub(crate) fn serve<T: EnrollmentSource>(
     config: &Config,
     token_source: &T,
     state_directory: PathBuf,
@@ -22,7 +22,7 @@ pub(crate) fn serve<T: TokenSource>(
     notion_config: &NotionConfig,
     task_values: &TaskValues,
 ) -> Result<String, String> {
-    let token = token_source.load()?;
+    let enrollment = token_source.load()?;
     let address: SocketAddr = config
         .runner
         .bind_address
@@ -52,10 +52,12 @@ pub(crate) fn serve<T: TokenSource>(
             .await
             .map_err(|error| format!("cannot bind HTTP server: {error}"))?;
         let shutdown = shutdown_signal()?;
+        let webhook_path = enrollment.webhook_path();
         run(
             listener,
             &config.runner,
-            token.into_bytes(),
+            webhook_path,
+            enrollment.verification_token().to_vec(),
             notion,
             coordinator,
             dispatcher,
@@ -85,6 +87,7 @@ fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, String
 async fn run<N, S, F>(
     listener: TcpListener,
     runner: &crate::config::RunnerConfig,
+    webhook_path: String,
     token: Vec<u8>,
     notion: N,
     coordinator: Arc<RevisionCoordinator<S>>,
@@ -122,10 +125,17 @@ where
     let dispatcher_drain = dispatcher.clone();
     let (stop, http_stop) = watch::channel(false);
     let scheduler_stop = stop.subscribe();
-    let mut http = Box::pin(http::run(listener, runner, token, dispatcher, async move {
-        let mut stop = http_stop;
-        let _ = stop.changed().await;
-    }));
+    let mut http = Box::pin(http::run(
+        listener,
+        runner,
+        webhook_path,
+        token,
+        dispatcher,
+        async move {
+            let mut stop = http_stop;
+            let _ = stop.changed().await;
+        },
+    ));
     let mut scheduler = Box::pin(periodic_reconciliation(
         notion,
         coordinator,
@@ -205,6 +215,7 @@ mod tests {
     use tokio::sync::{Semaphore, oneshot};
 
     const TOKEN: &[u8] = b"verification-secret-placeholder";
+    const WEBHOOK_PATH: &str = "/notion/webhook/00000000-0000-4000-8000-000000000071";
 
     struct QueryStep {
         result: Result<PendingTaskPage, String>,
@@ -392,7 +403,7 @@ mod tests {
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
         let mut request = format!(
-            "POST /notion/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: sha256={signature}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST {WEBHOOK_PATH} HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: sha256={signature}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .into_bytes();
@@ -432,6 +443,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -491,6 +503,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -529,6 +542,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -577,6 +591,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -640,6 +655,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -705,6 +721,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,
@@ -758,6 +775,7 @@ mod tests {
             run(
                 listener,
                 &runner,
+                WEBHOOK_PATH.to_owned(),
                 TOKEN.to_vec(),
                 notion,
                 coordinator,

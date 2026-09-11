@@ -30,6 +30,7 @@ use uuid::Uuid;
 
 const ENROLLMENT_FILE: &str = "notion-webhook-enrollment.json";
 const ENROLLMENT_ADDRESS: &str = "127.0.0.1:8080";
+pub(crate) const WEBHOOK_BASE_PATH: &str = "/notion/webhook";
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONNECTION_DEADLINE: Duration = Duration::from_secs(10);
@@ -42,16 +43,26 @@ struct VerificationPayload {
     verification_token: String,
 }
 
-#[derive(Deserialize, Serialize)]
-struct Enrollment {
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Enrollment {
     callback_id: Uuid,
     verification_token: String,
 }
 
 type EnrollmentResultSender = oneshot::Sender<Result<String, String>>;
 
-pub trait TokenSource {
-    fn load(&self) -> Result<String, String>;
+impl Enrollment {
+    pub(crate) fn webhook_path(&self) -> String {
+        format!("{WEBHOOK_BASE_PATH}/{}", self.callback_id)
+    }
+
+    pub(crate) fn verification_token(&self) -> &[u8] {
+        self.verification_token.as_bytes()
+    }
+}
+
+pub(crate) trait EnrollmentSource {
+    fn load(&self) -> Result<Enrollment, String>;
 }
 
 #[derive(Clone)]
@@ -105,8 +116,8 @@ impl FileTokenStore {
     }
 }
 
-impl TokenSource for FileTokenStore {
-    fn load(&self) -> Result<String, String> {
+impl EnrollmentSource for FileTokenStore {
+    fn load(&self) -> Result<Enrollment, String> {
         crate::config::ensure_private_directory(&self.state_directory)?;
         let enrollment: Enrollment =
             serde_json::from_slice(&read_private_file(&self.destination())?).map_err(|_| {
@@ -115,7 +126,7 @@ impl TokenSource for FileTokenStore {
         if enrollment.verification_token.trim().is_empty() {
             Err("private webhook enrollment is incomplete; run webhook-enroll --rotate".to_owned())
         } else {
-            Ok(enrollment.verification_token)
+            Ok(enrollment)
         }
     }
 }
@@ -152,7 +163,7 @@ async fn enroll_with_listener<W: Write>(
     rotate: bool,
     output: &mut W,
 ) -> Result<String, String> {
-    let path = format!("/notion/webhook/{callback_id}");
+    let path = format!("{WEBHOOK_BASE_PATH}/{callback_id}");
     writeln!(
         output,
         "Register this callback URL in Notion: https://{hostname}{path}"
@@ -462,7 +473,12 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(receiver.await.unwrap().unwrap(), "secret");
-        assert_eq!(state.store.load().unwrap(), "secret");
+        let enrollment = state.store.load().unwrap();
+        assert_eq!(enrollment.verification_token(), b"secret");
+        assert_eq!(
+            enrollment.webhook_path(),
+            "/notion/webhook/00000000-0000-0000-0000-000000000000"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -505,7 +521,7 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        assert_eq!(store.load().unwrap(), "first");
+        assert_eq!(store.load().unwrap().verification_token(), b"first");
 
         let error = store
             .persist(
@@ -518,7 +534,7 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("already exists"));
         assert!(!error.contains("refused-secret"));
-        assert_eq!(store.load().unwrap(), "first");
+        assert_eq!(store.load().unwrap().verification_token(), b"first");
 
         let second = Enrollment {
             callback_id: Uuid::new_v4(),
@@ -529,6 +545,31 @@ mod tests {
         assert_eq!(saved.callback_id, second.callback_id);
         assert_eq!(saved.verification_token, "second");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn serving_requires_a_complete_well_formed_enrollment() {
+        for (contents, expected) in [
+            (
+                br#"{"verification_token":"secret"}"#.as_slice(),
+                "private webhook enrollment is malformed; run webhook-enroll --rotate",
+            ),
+            (
+                br#"{"callback_id":"not-a-uuid","verification_token":"secret"}"#.as_slice(),
+                "private webhook enrollment is malformed; run webhook-enroll --rotate",
+            ),
+            (
+                br#"{"callback_id":"00000000-0000-4000-8000-000000000071","verification_token":""}"#.as_slice(),
+                "private webhook enrollment is incomplete; run webhook-enroll --rotate",
+            ),
+        ] {
+            let root = temporary_directory();
+            let store = FileTokenStore::new(root.join("state"));
+            crate::config::ensure_private_directory(&store.state_directory).unwrap();
+            write_private_file(&store.destination(), contents).unwrap();
+            assert_eq!(store.load().unwrap_err(), expected);
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -578,7 +619,12 @@ mod tests {
         };
         let (result, ()) = tokio::join!(enrollment, client);
         assert!(result.unwrap().contains("one-time-secret"));
-        assert_eq!(store.load().unwrap(), "one-time-secret");
+        let saved = store.load().unwrap();
+        assert_eq!(saved.verification_token(), b"one-time-secret");
+        assert_eq!(
+            saved.webhook_path(),
+            format!("/notion/webhook/{callback_id}")
+        );
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Register this callback URL in Notion: https://handover.example.test/notion/webhook/00000000-0000-4000-8000-000000000070\n"

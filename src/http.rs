@@ -97,6 +97,7 @@ struct HttpRequest<'a> {
 pub(crate) async fn run<D, F>(
     listener: TcpListener,
     config: &RunnerConfig,
+    webhook_path: String,
     token: Vec<u8>,
     dispatcher: D,
     shutdown: F,
@@ -107,7 +108,7 @@ where
 {
     run_server(
         listener,
-        state(config, token, dispatcher),
+        state(config, webhook_path, token, dispatcher),
         shutdown,
         CONNECTION_DEADLINE,
         Arc::new(AdmissionMetrics::default()),
@@ -115,9 +116,14 @@ where
     .await
 }
 
-fn state<D: EventDispatcher>(config: &RunnerConfig, token: Vec<u8>, dispatcher: D) -> HttpState<D> {
+fn state<D: EventDispatcher>(
+    config: &RunnerConfig,
+    webhook_path: String,
+    token: Vec<u8>,
+    dispatcher: D,
+) -> HttpState<D> {
     HttpState {
-        webhook_path: Arc::from(config.webhook_path.as_str()),
+        webhook_path: Arc::from(webhook_path),
         health_path: Arc::from(config.health_path.as_str()),
         token: Arc::from(token),
         dispatcher: Arc::new(dispatcher),
@@ -368,6 +374,7 @@ mod tests {
     fn test_state() -> HttpState<RecordingDispatcher> {
         state(
             &config("127.0.0.1:0"),
+            "/custom/webhook/00000000-0000-4000-8000-000000000071".to_owned(),
             TOKEN.to_vec(),
             RecordingDispatcher::default(),
         )
@@ -415,7 +422,12 @@ mod tests {
         let signed = signature(body);
         assert_eq!(
             handle(
-                request(&Method::POST, "/custom/webhook", &empty, body),
+                request(
+                    &Method::POST,
+                    "/custom/webhook/00000000-0000-4000-8000-000000000071",
+                    &empty,
+                    body
+                ),
                 &state,
                 Some(&signed)
             )
@@ -427,7 +439,12 @@ mod tests {
         let reformatted = r#"{"type":"page.updated","value":"å"}"#.as_bytes();
         assert_eq!(
             handle(
-                request(&Method::POST, "/custom/webhook", &empty, reformatted),
+                request(
+                    &Method::POST,
+                    "/custom/webhook/00000000-0000-4000-8000-000000000071",
+                    &empty,
+                    reformatted
+                ),
                 &state,
                 Some(&signed)
             )
@@ -436,7 +453,12 @@ mod tests {
         );
         assert_eq!(
             handle(
-                request(&Method::POST, "/custom/webhook", &empty, b"not-json-secret"),
+                request(
+                    &Method::POST,
+                    "/custom/webhook/00000000-0000-4000-8000-000000000071",
+                    &empty,
+                    b"not-json-secret"
+                ),
                 &state,
                 None
             )
@@ -547,6 +569,17 @@ mod tests {
             ),
             404
         );
+        for rejected_path in [
+            "/custom/webhook",
+            "/custom/webhook/",
+            "/custom/webhook/not-a-uuid",
+            "/custom/webhook/00000000-0000-4000-8000-000000000072",
+        ] {
+            let request = format!(
+                "POST {rejected_path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            assert_eq!(status(&exchange(address, request.as_bytes()).await), 404);
+        }
         assert_eq!(
             status(
                 &exchange(
@@ -561,7 +594,7 @@ mod tests {
             status(
                 &exchange(
                     address,
-                    b"GET /custom/webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n"
+                    b"GET /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n"
                 )
                 .await
             ),
@@ -571,7 +604,7 @@ mod tests {
             status(
                 &exchange(
                     address,
-                    b"POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: malformed\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n"
+                    b"POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: malformed\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n"
                 )
                 .await
             ),
@@ -581,7 +614,7 @@ mod tests {
         let body = br#"{ "type": "page.updated" }"#;
         let signed = signature(body);
         let wire = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nx-NoTiOn-SiGnAtUrE: {signed}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nx-NoTiOn-SiGnAtUrE: {signed}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let mut request = wire.into_bytes();
@@ -589,7 +622,7 @@ mod tests {
         assert_eq!(status(&exchange(address, &request).await), 200);
 
         let duplicate = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {signed}\r\nx-notion-signature: {signed}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {signed}\r\nx-notion-signature: {signed}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         );
         assert_eq!(status(&exchange(address, duplicate.as_bytes()).await), 401);
         stop(shutdown, task).await;
@@ -600,13 +633,13 @@ mod tests {
         let (address, shutdown, task, _) = start("127.0.0.1:0", Duration::from_millis(100)).await;
         let invalid = "sha256=0000000000000000000000000000000000000000000000000000000000000000";
         let oversized = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             MAX_WEBHOOK_BODY_BYTES + 1
         );
         assert_eq!(status(&exchange(address, oversized.as_bytes()).await), 413);
 
         let unauthenticated = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             MAX_WEBHOOK_BODY_BYTES
         );
         assert_eq!(
@@ -616,7 +649,7 @@ mod tests {
 
         let chunk = vec![b'a'; MAX_WEBHOOK_BODY_BYTES + 1];
         let chunk_header = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n",
             chunk.len()
         );
         let mut chunked = chunk_header.into_bytes();
@@ -628,7 +661,7 @@ mod tests {
         let complete_slow_body = vec![b'a'; 100];
         let slow_signature = signature(&complete_slow_body);
         let partial = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {slow_signature}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {slow_signature}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{"
         );
         slow.write_all(partial.as_bytes()).await.unwrap();
         assert_eq!(
@@ -652,7 +685,7 @@ mod tests {
         assert_eq!(status(&slow_response), 408);
 
         let truncated = format!(
-            "POST /custom/webhook HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{{}}"
+            "POST /custom/webhook/00000000-0000-4000-8000-000000000071 HTTP/1.1\r\nHost: localhost\r\nX-Notion-Signature: {invalid}\r\nContent-Length: 20\r\nConnection: close\r\n\r\n{{}}"
         );
         assert_eq!(
             status(&exchange_with_eof(address, truncated.as_bytes()).await),
