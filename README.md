@@ -301,6 +301,15 @@ reconciliation_interval_seconds = 60
 bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
+
+# Optional managed Cloudflare Tunnel profile. The tunnel and hostname already
+# exist in Cloudflare; agent-handover neither creates nor changes them.
+[cloudflared]
+executable = "cloudflared"
+hostname = "handover.example.com"
+tunnel_id = "<EXISTING_TUNNEL_UUID>"
+credentials_file = "/absolute/XDG_CONFIG_HOME/agent-handover/<EXISTING_TUNNEL_UUID>.json"
+# Alternatively, replace credentials_file with token = "<EXISTING_TUNNEL_TOKEN>".
 ```
 
 Supported sandbox values are `read-only`, `workspace-write`, and
@@ -332,6 +341,16 @@ The callback UUID and webhook verification token are stored together at
 `$HOME/.local/state/agent-handover`. The file is created atomically with mode
 `0600`; symbolic links and unsafe existing files are refused. Rotation replaces
 the pair in one rename, so the values cannot come from different enrollments.
+
+The optional `[cloudflared]` profile selects an already provisioned named
+tunnel. Its hostname is validated locally and it requires exactly one
+credential form: a mode-`0600` credential file placed directly in the private
+XDG configuration directory or a token held in the mode-`0600` host profile.
+The runner writes generated ingress configuration
+below the private state directory with mode `0600`; it routes only the enrolled
+callback UUID to the configured loopback origin and ends in an HTTP 404
+catch-all. Validating and preparing this local configuration never contacts
+Cloudflare or changes account resources.
 
 ## Commands
 

@@ -28,6 +28,7 @@ pub struct Config {
     pub journal_values: JournalValues,
     pub codex: CodexConfig,
     pub runner: RunnerConfig,
+    pub cloudflared: Option<CloudflaredConfig>,
 }
 
 #[derive(Deserialize)]
@@ -40,6 +41,7 @@ struct FileConfig {
     journal_values: JournalValues,
     codex: CodexConfig,
     runner: RunnerConfig,
+    cloudflared: Option<CloudflaredConfig>,
 }
 
 #[derive(Deserialize)]
@@ -274,6 +276,7 @@ impl fmt::Debug for Config {
             .field("journal_values", &self.journal_values)
             .field("codex", &self.codex)
             .field("runner", &self.runner)
+            .field("cloudflared", &self.cloudflared)
             .finish()
     }
 }
@@ -352,6 +355,32 @@ pub struct RunnerConfig {
     pub bind_address: String,
     pub webhook_path: String,
     pub health_path: String,
+}
+
+/// The optional, locally managed Cloudflare Tunnel profile.  A token remains
+/// in the private host profile; a credentials file must likewise live below
+/// the private configuration directory.
+#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CloudflaredConfig {
+    pub executable: PathBuf,
+    pub hostname: String,
+    pub tunnel_id: String,
+    pub credentials_file: Option<PathBuf>,
+    pub token: Option<String>,
+}
+
+impl fmt::Debug for CloudflaredConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CloudflaredConfig")
+            .field("executable", &"<redacted>")
+            .field("hostname", &"<redacted>")
+            .field("tunnel_id", &"<redacted>")
+            .field("credentials_file", &"<redacted>")
+            .field("token", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -456,6 +485,7 @@ fn load_with_resolver(
         journal_values: file_config.journal_values,
         codex: file_config.codex,
         runner: file_config.runner,
+        cloudflared: file_config.cloudflared,
     };
     validate(&config)?;
     Ok(config)
@@ -716,7 +746,59 @@ fn validate(config: &Config) -> Result<(), String> {
     if config.runner.webhook_path == config.runner.health_path {
         return Err("runner.webhook_path and runner.health_path must be distinct".to_owned());
     }
+    if let Some(cloudflared) = &config.cloudflared {
+        validate_cloudflared(cloudflared)?;
+    }
     Ok(())
+}
+
+fn validate_cloudflared(config: &CloudflaredConfig) -> Result<(), String> {
+    if config.executable.as_os_str().is_empty() {
+        return Err("configuration field cloudflared.executable must not be empty".to_owned());
+    }
+    if !is_executable_available(&config.executable) {
+        return Err(
+            "configured cloudflared executable is unavailable or not executable".to_owned(),
+        );
+    }
+    crate::enrollment::validate_hostname(&config.hostname).map_err(|_| {
+        "configuration field cloudflared.hostname must be a plain DNS hostname".to_owned()
+    })?;
+    if uuid::Uuid::parse_str(&config.tunnel_id).is_err() {
+        return Err("configuration field cloudflared.tunnel_id must be a UUID".to_owned());
+    }
+    match (&config.credentials_file, &config.token) {
+        (Some(path), None) => {
+            if !path.is_absolute() {
+                return Err(
+                    "configuration field cloudflared.credentials_file must be an absolute path"
+                        .to_owned(),
+                );
+            }
+        }
+        (None, Some(token)) if !token.trim().is_empty() => {}
+        _ => {
+            return Err(
+                "configure exactly one of cloudflared.credentials_file or cloudflared.token"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn is_executable_available(executable: &Path) -> bool {
+    let has_path_separator = executable.components().count() != 1;
+    if has_path_separator {
+        is_executable(executable)
+    } else {
+        let search_path = env::var_os("PATH").unwrap_or_default();
+        env::split_paths(&search_path).any(|directory| is_executable(&directory.join(executable)))
+    }
+}
+
+fn is_executable(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
 }
 
 fn validate_endpoint_path(name: &str, value: &str) -> Result<(), String> {
@@ -810,6 +892,78 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#
+    }
+
+    #[test]
+    fn validates_an_optional_cloudflared_profile_with_exactly_one_credential_form() {
+        let root = temporary_directory();
+        let credentials = root.join("credentials.json");
+        let executable = write_executable(&root, "cloudflared", "#!/bin/sh\nexit 0\n");
+        let profile = format!(
+            "\n[cloudflared]\nexecutable = \"{}\"\nhostname = \"handover.example.test\"\ntunnel_id = \"00000000-0000-4000-8000-000000000079\"\ncredentials_file = \"{}\"\n",
+            executable.display(),
+            credentials.display()
+        );
+        let paths = write_fixture(&root, &(fixture().to_owned() + &profile), 0o600);
+        assert!(load(&paths).is_ok());
+
+        let second_root = temporary_directory();
+        let both = profile.replace(
+            "credentials_file =",
+            "token = \"secret-token\"\ncredentials_file =",
+        );
+        let paths = write_fixture(&second_root, &(fixture().to_owned() + &both), 0o600);
+        let error = load(&paths).unwrap_err();
+        assert_eq!(
+            error,
+            "configure exactly one of cloudflared.credentials_file or cloudflared.token"
+        );
+        assert!(!error.contains("secret-token"));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_cloudflared_profile_values_without_echoing_them() {
+        let root = temporary_directory();
+        let profile = "\n[cloudflared]\nexecutable = \"\"\nhostname = \"https://private.example\"\ntunnel_id = \"not-a-uuid\"\ntoken = \"secret-token\"\n";
+        let paths = write_fixture(&root, &(fixture().to_owned() + profile), 0o600);
+        let error = load(&paths).unwrap_err();
+        assert_eq!(
+            error,
+            "configuration field cloudflared.executable must not be empty"
+        );
+        assert!(!error.contains("private.example"));
+        assert!(!error.contains("secret-token"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_or_non_executable_cloudflared_programs() {
+        let root = temporary_directory();
+        let profile = format!(
+            "\n[cloudflared]\nexecutable = \"{}\"\nhostname = \"handover.example.test\"\ntunnel_id = \"00000000-0000-4000-8000-000000000079\"\ntoken = \"secret-token\"\n",
+            root.join("missing-cloudflared").display()
+        );
+        let paths = write_fixture(&root, &(fixture().to_owned() + &profile), 0o600);
+        let error = load(&paths).unwrap_err();
+        assert_eq!(
+            error,
+            "configured cloudflared executable is unavailable or not executable"
+        );
+        assert!(!error.contains("secret-token"));
+        let executable = root.join("missing-cloudflared");
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(executable)
+            .unwrap();
+        assert_eq!(
+            load(&paths).unwrap_err(),
+            "configured cloudflared executable is unavailable or not executable"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn write_fixture(root: &Path, contents: &str, mode: u32) -> HostPaths {

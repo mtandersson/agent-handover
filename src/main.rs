@@ -2,6 +2,9 @@ use std::env;
 use std::io;
 use std::process::ExitCode;
 
+use enrollment::EnrollmentSource;
+
+mod cloudflare;
 mod config;
 mod coordination;
 mod discovery;
@@ -138,22 +141,35 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {
             config::load(&paths).and_then(|config| match command {
-                Command::Serve => notion::NotionHttpClient::new(
-                    &config.notion,
-                    &config.task_properties,
-                    &config.journal_properties,
-                    &config.journal_values,
-                )
-                .and_then(|notion| {
-                    serving::serve(
-                        &config,
-                        &enrollment::FileTokenStore::new(paths.state_directory.clone()),
-                        paths.state_directory,
-                        notion,
+                Command::Serve => {
+                    if let Some(cloudflared) = &config.cloudflared {
+                        let enrollment =
+                            enrollment::FileTokenStore::new(paths.state_directory.clone())
+                                .load()?;
+                        cloudflare::prepare(
+                            cloudflared,
+                            &paths,
+                            &config.runner,
+                            enrollment.callback_id(),
+                        )?;
+                    }
+                    notion::NotionHttpClient::new(
                         &config.notion,
-                        &config.task_values,
+                        &config.task_properties,
+                        &config.journal_properties,
+                        &config.journal_values,
                     )
-                }),
+                    .and_then(|notion| {
+                        serving::serve(
+                            &config,
+                            &enrollment::FileTokenStore::new(paths.state_directory.clone()),
+                            paths.state_directory,
+                            notion,
+                            &config.notion,
+                            &config.task_values,
+                        )
+                    })
+                }
                 Command::RunOnce => notion::NotionHttpClient::new(
                     &config.notion,
                     &config.task_properties,

@@ -55,6 +55,10 @@ pub(crate) struct Enrollment {
 type EnrollmentResultSender = oneshot::Sender<Result<String, String>>;
 
 impl Enrollment {
+    pub(crate) fn callback_id(&self) -> Uuid {
+        self.callback_id
+    }
+
     pub(crate) fn webhook_path(&self) -> String {
         format!("{WEBHOOK_BASE_PATH}/{}", self.callback_id)
     }
@@ -313,7 +317,7 @@ where
     outcome
 }
 
-fn validate_hostname(hostname: &str) -> Result<(), String> {
+pub(crate) fn validate_hostname(hostname: &str) -> Result<(), String> {
     let valid = !hostname.is_empty()
         && hostname.len() <= 253
         && !hostname.starts_with('.')
