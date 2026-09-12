@@ -1,6 +1,9 @@
 use std::env;
+use std::fs;
 use std::io;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use enrollment::EnrollmentSource;
 
@@ -16,6 +19,48 @@ mod orchestration;
 mod reconciliation;
 mod serving;
 mod state;
+
+static ENROLLMENT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_enrollment_cancellation(_: libc::c_int) {
+    ENROLLMENT_CANCELLED.store(true, Ordering::Relaxed);
+}
+
+struct EnrollmentSignalGuard {
+    interrupt: libc::sigaction,
+    terminate: libc::sigaction,
+}
+
+impl EnrollmentSignalGuard {
+    fn install() -> Result<Self, String> {
+        ENROLLMENT_CANCELLED.store(false, Ordering::Relaxed);
+        let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        action.sa_sigaction = request_enrollment_cancellation as *const () as usize;
+        unsafe { libc::sigemptyset(&mut action.sa_mask) };
+        let mut interrupt = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        if unsafe { libc::sigaction(libc::SIGINT, &action, &mut interrupt) } != 0 {
+            return Err("cannot supervise managed tunnel enrollment".to_owned());
+        }
+        let mut terminate = unsafe { std::mem::zeroed::<libc::sigaction>() };
+        if unsafe { libc::sigaction(libc::SIGTERM, &action, &mut terminate) } != 0 {
+            unsafe { libc::sigaction(libc::SIGINT, &interrupt, std::ptr::null_mut()) };
+            return Err("cannot supervise managed tunnel enrollment".to_owned());
+        }
+        Ok(Self {
+            interrupt,
+            terminate,
+        })
+    }
+}
+
+impl Drop for EnrollmentSignalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.interrupt, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &self.terminate, std::ptr::null_mut());
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Command {
@@ -131,12 +176,77 @@ fn main() -> ExitCode {
                     .enable_all()
                     .build()
                     .map_err(|_| "cannot initialize webhook enrollment runtime".to_owned())?;
-                runtime.block_on(enrollment::enroll(
-                    &hostname,
-                    &enrollment::FileTokenStore::new(paths.state_directory),
-                    rotate,
-                    &mut io::stdout().lock(),
-                ))
+                let store = enrollment::FileTokenStore::new(paths.state_directory.clone());
+                // Enrollment remains usable without a host profile for an
+                // externally managed tunnel. If one exists, only its
+                // credential-file delivery mode is managed here.
+                if fs::symlink_metadata(&paths.config_file).is_ok() {
+                    // An unrelated or incomplete host configuration must not
+                    // turn the long-standing config-free manual enrollment
+                    // flow into an error. A valid managed profile opts in.
+                    match config::load(&paths) {
+                        Ok(configured) => {
+                        let runner = configured.runner;
+                        let profile = configured.cloudflared;
+                        if let Some(profile) = profile {
+                        if profile.hostname != hostname {
+                            return Err("managed tunnel hostname does not match webhook enrollment hostname".to_owned());
+                        }
+                        store.ensure_available(rotate)?;
+                        let callback_id = uuid::Uuid::new_v4();
+                            return runtime.block_on(async {
+                            let listener = enrollment::bind_listener().await?;
+                            let connector = cloudflare::prepare(
+                                &profile,
+                                &paths,
+                                &runner,
+                                callback_id,
+                            )?;
+                            let _signal_guard = EnrollmentSignalGuard::install()?;
+                            let supervisor = cloudflare::ConnectorSupervisor::start(
+                                &profile,
+                                &connector,
+                                &ENROLLMENT_CANCELLED,
+                            )?;
+                            let stdout = io::stdout();
+                            let mut output = stdout.lock();
+                            let enrollment = enrollment::enroll_with_listener(
+                                &hostname,
+                                callback_id,
+                                listener,
+                                &store,
+                                rotate,
+                                true,
+                                &mut output,
+                            );
+                            tokio::pin!(enrollment);
+                            let connector_exit = async {
+                                loop {
+                                    if ENROLLMENT_CANCELLED.load(Ordering::Relaxed) {
+                                        return Err("managed Cloudflare tunnel enrollment cancelled".to_owned());
+                                    }
+                                    if supervisor.exited()? {
+                                        return Err("managed Cloudflare tunnel exited during enrollment".to_owned());
+                                    }
+                                    tokio::time::sleep(Duration::from_millis(50)).await;
+                                }
+                            };
+                            tokio::pin!(connector_exit);
+                            tokio::select! {
+                                result = &mut enrollment => result,
+                                result = &mut connector_exit => result,
+                                _ = tokio::time::sleep(Duration::from_secs(900)) => Err("managed tunnel enrollment timed out".to_owned()),
+                            }
+                            });
+                        }
+                        }
+                        Err(_) if config::cloudflared_is_configured(&paths)? => {
+                            return Err("cannot load managed Cloudflare tunnel profile".to_owned());
+                        }
+                        Err(_) => {}
+                    }
+                }
+                runtime.block_on(enrollment::enroll(&hostname, &store, rotate, &mut io::stdout().lock()))
             })
         }
         Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {

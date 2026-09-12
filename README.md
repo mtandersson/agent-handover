@@ -218,8 +218,9 @@ claiming event or page state.
 #### External tunnel
 
 Notion requires a public HTTPS webhook URL and cannot reach localhost. Tunnel
-provisioning, DNS, credentials, configuration, and process supervision remain
-external to `agent-handover`. For example, a [locally managed Cloudflare
+provisioning and DNS remain external to `agent-handover`. Without a
+credential-file `[cloudflared]` profile, configuration and process supervision
+also remain external. For example, a [locally managed Cloudflare
 Tunnel][cloudflare-tunnel] can route only the generated callback path to the
 loopback-bound runner. Supply the existing tunnel's UUID and credentials, and
 replace `<CALLBACK_UUID>` with the value shown by `webhook-enroll`; never commit
@@ -309,7 +310,6 @@ executable = "cloudflared"
 hostname = "handover.example.com"
 tunnel_id = "<EXISTING_TUNNEL_UUID>"
 credentials_file = "/absolute/XDG_CONFIG_HOME/agent-handover/<EXISTING_TUNNEL_UUID>.json"
-# Alternatively, replace credentials_file with token = "<EXISTING_TUNNEL_TOKEN>".
 ```
 
 Supported sandbox values are `read-only`, `workspace-write`, and
@@ -343,14 +343,15 @@ The callback UUID and webhook verification token are stored together at
 the pair in one rename, so the values cannot come from different enrollments.
 
 The optional `[cloudflared]` profile selects an already provisioned named
-tunnel. Its hostname is validated locally and it requires exactly one
-credential form: a mode-`0600` credential file placed directly in the private
-XDG configuration directory or a token held in the mode-`0600` host profile.
-The runner writes generated ingress configuration
-below the private state directory with mode `0600`; it routes only the enrolled
-callback UUID to the configured loopback origin and ends in an HTTP 404
-catch-all. Validating and preparing this local configuration never contacts
-Cloudflare or changes account resources.
+tunnel. Its hostname is validated locally and it requires a mode-`0600`
+credential file placed directly in the private XDG configuration directory.
+During `webhook-enroll`, that profile starts `cloudflared` with a
+private generated ingress configuration and a loopback-only metrics endpoint.
+The runner waits for an active HA connection before printing the Notion steps,
+then terminates and reaps the connector when enrollment ends. The generated
+configuration routes only the enrolled callback UUID to the configured
+loopback origin and ends in an HTTP 404 catch-all. The runner never creates or
+changes Cloudflare account resources.
 
 ## Commands
 

@@ -357,17 +357,15 @@ pub struct RunnerConfig {
     pub health_path: String,
 }
 
-/// The optional, locally managed Cloudflare Tunnel profile.  A token remains
-/// in the private host profile; a credentials file must likewise live below
-/// the private configuration directory.
+/// The optional, locally managed Cloudflare Tunnel profile. Credentials must
+/// live directly below the private configuration directory.
 #[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct CloudflaredConfig {
     pub executable: PathBuf,
     pub hostname: String,
     pub tunnel_id: String,
-    pub credentials_file: Option<PathBuf>,
-    pub token: Option<String>,
+    pub credentials_file: PathBuf,
 }
 
 impl fmt::Debug for CloudflaredConfig {
@@ -378,7 +376,6 @@ impl fmt::Debug for CloudflaredConfig {
             .field("hostname", &"<redacted>")
             .field("tunnel_id", &"<redacted>")
             .field("credentials_file", &"<redacted>")
-            .field("token", &"<redacted>")
             .finish()
     }
 }
@@ -447,6 +444,23 @@ fn environment_base(
 
 pub fn load(paths: &HostPaths) -> Result<Config, String> {
     load_with_resolver(paths, &NtnTokenResolver::default())
+}
+
+/// Check only whether a private host profile explicitly opts into managed
+/// tunnel enrollment. This keeps webhook-enroll configuration-free unless the
+/// operator has declared that mode, without treating malformed profile input
+/// as a request to silently fall back to a manual tunnel.
+pub(crate) fn cloudflared_is_configured(paths: &HostPaths) -> Result<bool, String> {
+    ensure_private_parent(&paths.config_file)?;
+    let mut file = open_sensitive_file(&paths.config_file)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|_| "cannot inspect managed tunnel profile".to_owned())?;
+    let value = toml::from_str::<toml::Value>(&contents)
+        .map_err(|_| "cannot inspect managed tunnel profile".to_owned())?;
+    Ok(value
+        .as_table()
+        .is_some_and(|table| table.contains_key("cloudflared")))
 }
 
 fn load_with_resolver(
@@ -767,34 +781,44 @@ fn validate_cloudflared(config: &CloudflaredConfig) -> Result<(), String> {
     if uuid::Uuid::parse_str(&config.tunnel_id).is_err() {
         return Err("configuration field cloudflared.tunnel_id must be a UUID".to_owned());
     }
-    match (&config.credentials_file, &config.token) {
-        (Some(path), None) => {
-            if !path.is_absolute() {
-                return Err(
-                    "configuration field cloudflared.credentials_file must be an absolute path"
-                        .to_owned(),
-                );
-            }
-        }
-        (None, Some(token)) if !token.trim().is_empty() => {}
-        _ => {
-            return Err(
-                "configure exactly one of cloudflared.credentials_file or cloudflared.token"
-                    .to_owned(),
-            );
-        }
+    if !config.credentials_file.is_absolute() {
+        return Err(
+            "configuration field cloudflared.credentials_file must be an absolute path".to_owned(),
+        );
     }
     Ok(())
 }
 
-fn is_executable_available(executable: &Path) -> bool {
+pub(crate) fn resolve_executable(executable: &Path) -> Option<PathBuf> {
     let has_path_separator = executable.components().count() != 1;
     if has_path_separator {
-        is_executable(executable)
+        executable
+            .canonicalize()
+            .ok()
+            .filter(|path| is_executable(path))
     } else {
         let search_path = env::var_os("PATH").unwrap_or_default();
-        env::split_paths(&search_path).any(|directory| is_executable(&directory.join(executable)))
+        resolve_executable_in_path(executable, env::split_paths(&search_path))
     }
+}
+
+fn resolve_executable_in_path(
+    executable: &Path,
+    search_path: impl IntoIterator<Item = PathBuf>,
+) -> Option<PathBuf> {
+    search_path
+        .into_iter()
+        .map(|directory| directory.join(executable))
+        .find_map(|candidate| {
+            candidate
+                .canonicalize()
+                .ok()
+                .filter(|path| is_executable(path))
+        })
+}
+
+fn is_executable_available(executable: &Path) -> bool {
+    resolve_executable(executable).is_some()
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -895,7 +919,7 @@ health_path = "/health"
     }
 
     #[test]
-    fn validates_an_optional_cloudflared_profile_with_exactly_one_credential_form() {
+    fn validates_an_optional_credential_file_cloudflared_profile() {
         let root = temporary_directory();
         let credentials = root.join("credentials.json");
         let executable = write_executable(&root, "cloudflared", "#!/bin/sh\nexit 0\n");
@@ -908,25 +932,35 @@ health_path = "/health"
         assert!(load(&paths).is_ok());
 
         let second_root = temporary_directory();
-        let both = profile.replace(
+        let unsupported = profile.replace(
             "credentials_file =",
             "token = \"secret-token\"\ncredentials_file =",
         );
-        let paths = write_fixture(&second_root, &(fixture().to_owned() + &both), 0o600);
+        let paths = write_fixture(&second_root, &(fixture().to_owned() + &unsupported), 0o600);
         let error = load(&paths).unwrap_err();
-        assert_eq!(
-            error,
-            "configure exactly one of cloudflared.credentials_file or cloudflared.token"
-        );
+        assert!(error.contains("invalid configuration file"));
         assert!(!error.contains("secret-token"));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(second_root).unwrap();
     }
 
     #[test]
+    fn resolves_a_bare_connector_executable_to_an_absolute_path() {
+        let root = temporary_directory();
+        let executable = write_executable(&root, "cloudflared", "#!/bin/sh\nexit 0\n");
+
+        assert_eq!(
+            resolve_executable_in_path(Path::new("cloudflared"), vec![root.clone()]),
+            Some(executable.canonicalize().unwrap())
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_invalid_cloudflared_profile_values_without_echoing_them() {
         let root = temporary_directory();
-        let profile = "\n[cloudflared]\nexecutable = \"\"\nhostname = \"https://private.example\"\ntunnel_id = \"not-a-uuid\"\ntoken = \"secret-token\"\n";
+        let profile = "\n[cloudflared]\nexecutable = \"\"\nhostname = \"https://private.example\"\ntunnel_id = \"not-a-uuid\"\ncredentials_file = \"/private/credentials.json\"\n";
         let paths = write_fixture(&root, &(fixture().to_owned() + profile), 0o600);
         let error = load(&paths).unwrap_err();
         assert_eq!(
@@ -934,7 +968,7 @@ health_path = "/health"
             "configuration field cloudflared.executable must not be empty"
         );
         assert!(!error.contains("private.example"));
-        assert!(!error.contains("secret-token"));
+        assert!(!error.contains("private.example"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -942,7 +976,7 @@ health_path = "/health"
     fn rejects_missing_or_non_executable_cloudflared_programs() {
         let root = temporary_directory();
         let profile = format!(
-            "\n[cloudflared]\nexecutable = \"{}\"\nhostname = \"handover.example.test\"\ntunnel_id = \"00000000-0000-4000-8000-000000000079\"\ntoken = \"secret-token\"\n",
+            "\n[cloudflared]\nexecutable = \"{}\"\nhostname = \"handover.example.test\"\ntunnel_id = \"00000000-0000-4000-8000-000000000079\"\ncredentials_file = \"/private/credentials.json\"\n",
             root.join("missing-cloudflared").display()
         );
         let paths = write_fixture(&root, &(fixture().to_owned() + &profile), 0o600);
@@ -951,7 +985,6 @@ health_path = "/health"
             error,
             "configured cloudflared executable is unavailable or not executable"
         );
-        assert!(!error.contains("secret-token"));
         let executable = root.join("missing-cloudflared");
         OpenOptions::new()
             .write(true)
