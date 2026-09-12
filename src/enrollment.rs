@@ -85,7 +85,7 @@ impl FileTokenStore {
         self.state_directory.join(ENROLLMENT_FILE)
     }
 
-    fn ensure_available(&self, rotate: bool) -> Result<(), String> {
+    pub(crate) fn ensure_available(&self, rotate: bool) -> Result<(), String> {
         crate::config::ensure_private_directory(&self.state_directory)?;
         inspect_destination(&self.destination(), rotate)
     }
@@ -156,24 +156,42 @@ pub async fn enroll<W: Write>(
     validate_hostname(hostname)?;
     store.ensure_available(rotate)?;
     let callback_id = Uuid::new_v4();
-    let listener = TcpListener::bind(ENROLLMENT_ADDRESS).await.map_err(|_| {
-        "cannot bind the loopback enrollment listener; port 8080 may be occupied".to_owned()
-    })?;
-    enroll_with_listener(hostname, callback_id, listener, store, rotate, output).await
+    let listener = bind_listener().await?;
+    enroll_with_listener(
+        hostname,
+        callback_id,
+        listener,
+        store,
+        rotate,
+        false,
+        output,
+    )
+    .await
 }
 
-async fn enroll_with_listener<W: Write>(
+pub(crate) async fn bind_listener() -> Result<TcpListener, String> {
+    TcpListener::bind(ENROLLMENT_ADDRESS).await.map_err(|_| {
+        "cannot bind the loopback enrollment listener; port 8080 may be occupied".to_owned()
+    })
+}
+
+pub(crate) async fn enroll_with_listener<W: Write>(
     hostname: &str,
     callback_id: Uuid,
     listener: TcpListener,
     store: &FileTokenStore,
     rotate: bool,
+    managed_connector: bool,
     output: &mut W,
 ) -> Result<String, String> {
     let path = format!("{WEBHOOK_BASE_PATH}/{callback_id}");
-    write!(output, "{}", enrollment_guidance(hostname, &path))
-        .and_then(|()| output.flush())
-        .map_err(|_| "cannot display webhook enrollment guidance".to_owned())?;
+    write!(
+        output,
+        "{}",
+        enrollment_guidance(hostname, &path, managed_connector)
+    )
+    .and_then(|()| output.flush())
+    .map_err(|_| "cannot display webhook enrollment guidance".to_owned())?;
     let (sender, receiver) = oneshot::channel();
     let state = HttpState {
         expected_path: Arc::from(path),
@@ -195,15 +213,19 @@ async fn enroll_with_listener<W: Write>(
     ))
 }
 
-fn enrollment_guidance(hostname: &str, path: &str) -> String {
+fn enrollment_guidance(hostname: &str, path: &str, managed_connector: bool) -> String {
     let callback_url = format!("https://{hostname}{path}");
+    let tunnel_guidance = if managed_connector {
+        "1. The configured locally managed Cloudflare Tunnel is ready for this callback:\n"
+    } else {
+        "1. Expose only this callback through an externally managed HTTPS tunnel:\n"
+    };
     format!(
         "Notion webhook enrollment\n\
          \n\
          Keep this command running while Notion verifies the subscription.\n\
          \n\
-         1. Expose only this callback through an externally managed HTTPS tunnel:\n\
-            {callback_url}\n\
+         {tunnel_guidance}            {callback_url}\n\
             Forward {path} to http://127.0.0.1:8080.\n\
          2. Open Notion Connections: {NOTION_CONNECTIONS_URL}\n\
             Select the connection, open Webhooks, and create a subscription.\n\
@@ -631,6 +653,7 @@ mod tests {
             callback_id,
             listener,
             &store,
+            false,
             false,
             &mut output,
         );

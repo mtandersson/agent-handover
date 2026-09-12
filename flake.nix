@@ -68,6 +68,8 @@
       });
       tests = craneLib.cargoTest (commonArgs // {
         inherit cargoArtifacts;
+        nativeBuildInputs = [ pkgs.netcat ];
+        CLOUDFLARED_TEST_NC = "${pkgs.netcat}/bin/nc";
         cargoTestExtraArgs = "--all-targets --all-features";
       });
       quality = pkgs.linkFarm "agent-handover-quality" [
@@ -106,12 +108,14 @@
           pkgs.gnutar
           pkgs.gzip
           pkgs.nodejs_24
+          pkgs.netcat
           pkgs.patchelf
           pkgs.rustc
           pkgs.rustfmt
           pkgs.shellcheck
           releaseTooling
         ];
+        CLOUDFLARED_TEST_NC = "${pkgs.netcat}/bin/nc";
       };
     };
 }
