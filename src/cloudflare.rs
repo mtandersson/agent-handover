@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const CONFIGURATION_FILE: &str = "cloudflared-config.yml";
+const REMOTE_TOKEN_FILE: &str = "cloudflared-token";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL: Duration = Duration::from_millis(50);
 const MAX_METRICS_RESPONSE_BYTES: usize = 64 * 1024;
@@ -203,15 +204,35 @@ impl ConnectorSupervisor {
         // its child no inherited environment.
         let executable = crate::config::resolve_executable(&profile.executable)
             .ok_or_else(|| "cannot start managed Cloudflare tunnel".to_owned())?;
-        let child = Command::new(executable)
-            .env_clear()
-            .arg("--config")
-            .arg(&connector.configuration_file)
-            .arg("--metrics")
-            .arg(metrics)
-            .arg("tunnel")
-            .arg("run")
-            .arg(&profile.tunnel_id)
+        let mut command = Command::new(executable);
+        command.env_clear();
+        match &connector.authentication {
+            ConnectorAuthentication::CredentialConfiguration(configuration_file) => {
+                // Credential-file tunnels own their ingress locally.
+                command
+                    .arg("--config")
+                    .arg(configuration_file)
+                    .arg("--metrics")
+                    .arg(metrics)
+                    .arg("tunnel")
+                    .arg("run")
+                    .arg(&profile.tunnel_id);
+            }
+            ConnectorAuthentication::RemoteTokenFile(token_file) => {
+                // A remotely managed tunnel obtains ingress exclusively from
+                // the Cloudflare dashboard. `--token-file` is supported by
+                // cloudflared 2025.4.0 and later and does not expose the
+                // credential in argv or environment.
+                command
+                    .arg("--metrics")
+                    .arg(metrics)
+                    .arg("tunnel")
+                    .arg("run")
+                    .arg("--token-file")
+                    .arg(token_file);
+            }
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -346,14 +367,20 @@ fn metrics_contain_active_connection(response: &[u8]) -> bool {
 /// changes an account resource.
 #[derive(PartialEq, Eq)]
 pub(crate) struct PreparedConnector {
-    pub(crate) configuration_file: PathBuf,
+    authentication: ConnectorAuthentication,
+}
+
+#[derive(PartialEq, Eq)]
+enum ConnectorAuthentication {
+    CredentialConfiguration(PathBuf),
+    RemoteTokenFile(PathBuf),
 }
 
 impl std::fmt::Debug for PreparedConnector {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedConnector")
-            .field("configuration_file", &"<redacted>")
+            .field("authentication", &"<redacted>")
             .finish()
     }
 }
@@ -389,8 +416,44 @@ pub(crate) fn prepare(
     let destination = directory.join(CONFIGURATION_FILE);
     write_private_configuration(&destination, &render(profile, runner, callback_id))?;
     Ok(PreparedConnector {
-        configuration_file: destination,
+        authentication: ConnectorAuthentication::CredentialConfiguration(destination),
     })
+}
+
+/// Store the dashboard-issued connector token in private state so cloudflared
+/// can consume it with `--token-file`. This keeps the credential out of argv
+/// and the connector environment while deliberately avoiding a local ingress
+/// configuration for remotely managed tunnels.
+pub(crate) fn prepare_remote(
+    profile: &CloudflaredConfig,
+    paths: &HostPaths,
+) -> Result<PreparedConnector, String> {
+    let token = profile
+        .token
+        .as_deref()
+        .ok_or_else(|| "managed Cloudflare tunnel token is unavailable".to_owned())?;
+    let directory = paths.state_directory.join("cloudflared");
+    ensure_private_directory(&directory)
+        .map_err(|_| "cannot prepare private connector credential directory".to_owned())?;
+    let destination = directory.join(REMOTE_TOKEN_FILE);
+    write_private_token(&destination, token)?;
+    Ok(PreparedConnector {
+        authentication: ConnectorAuthentication::RemoteTokenFile(destination),
+    })
+}
+
+/// Establish the ordering boundary for remote enrollment: a token file can
+/// only exist after the exact dashboard ingress has been verified. A caller
+/// cannot start a connector without the resulting prepared capability.
+pub(crate) async fn verify_and_prepare_remote<C: RemoteTunnelConfiguration>(
+    client: &C,
+    profile: &CloudflaredConfig,
+    paths: &HostPaths,
+    runner: &RunnerConfig,
+    callback_id: Uuid,
+) -> Result<PreparedConnector, String> {
+    verify_remote_ingress(client, profile, runner, callback_id).await?;
+    prepare_remote(profile, paths)
 }
 
 fn safe_credential_filename(path: &Path) -> bool {
@@ -463,6 +526,27 @@ fn write_private_configuration(destination: &Path, contents: &str) -> Result<(),
         .and_then(|()| file.sync_all())
         .map_err(|_| "cannot write private connector configuration".to_owned())?;
     Ok(())
+}
+
+fn write_private_token(destination: &Path, token: &str) -> Result<(), String> {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("private connector credential path is unsafe".to_owned());
+        }
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(destination)
+        .map_err(|_| "cannot write private connector credential".to_owned())?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot secure private connector credential".to_owned())?;
+    file.write_all(token.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|_| "cannot write private connector credential".to_owned())
 }
 
 #[cfg(test)]
@@ -575,6 +659,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejected_remote_ingress_never_prepares_a_token_connector() {
+        let root = temporary_directory();
+        let paths = HostPaths {
+            config_file: root.join("config/agent-handover/config.toml"),
+            state_directory: root.join("state"),
+        };
+        let remote = FakeRemote(Ok(RemoteTunnelConfig {
+            ingress: vec![
+                RemoteIngress {
+                    hostname: Some("handover.example.test".into()),
+                    path: Some("^/notion/webhook/.*$".into()),
+                    service: "http://127.0.0.1:8080".into(),
+                },
+                RemoteIngress {
+                    hostname: None,
+                    path: None,
+                    service: "http_status:404".into(),
+                },
+            ],
+        }));
+        assert_eq!(
+            verify_and_prepare_remote(&remote, &remote_profile(), &paths, &runner(), Uuid::nil())
+                .await
+                .err()
+                .unwrap(),
+            "remote Cloudflare tunnel ingress does not restrict the webhook callback"
+        );
+        assert!(
+            !paths
+                .state_directory
+                .join("cloudflared")
+                .join(REMOTE_TOKEN_FILE)
+                .exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn writes_private_exact_path_ingress_configuration() {
         let root = temporary_directory();
@@ -598,15 +720,20 @@ mod tests {
             Uuid::parse_str("00000000-0000-4000-8000-000000000078").unwrap(),
         )
         .unwrap();
+        let ConnectorAuthentication::CredentialConfiguration(configuration_file) =
+            &prepared.authentication
+        else {
+            panic!("credential profile must prepare a local configuration");
+        };
         assert_eq!(
-            fs::read_to_string(&prepared.configuration_file).unwrap(),
+            fs::read_to_string(configuration_file).unwrap(),
             "tunnel: 00000000-0000-4000-8000-000000000079\ncredentials-file: \"".to_owned()
                 + credentials.to_str().unwrap()
                 + "\""
                 + "\ningress:\n  - hostname: handover.example.test\n    path: ^/notion/webhook/00000000-0000-4000-8000-000000000078$\n    service: http://127.0.0.1:8080\n  - service: http_status:404\n"
         );
         assert_eq!(
-            fs::metadata(&prepared.configuration_file).unwrap().mode() & 0o777,
+            fs::metadata(configuration_file).unwrap().mode() & 0o777,
             0o600
         );
         assert_eq!(
@@ -725,7 +852,12 @@ mod tests {
             Uuid::nil(),
         )
         .unwrap();
-        let contents = fs::read_to_string(prepared.configuration_file).unwrap();
+        let ConnectorAuthentication::CredentialConfiguration(configuration_file) =
+            prepared.authentication
+        else {
+            panic!("credential profile must prepare a local configuration");
+        };
+        let contents = fs::read_to_string(configuration_file).unwrap();
         assert!(contents.contains(&format!(
             "credentials-file: {}\n",
             serde_json::to_string(&credentials.to_string_lossy()).unwrap()
@@ -737,7 +869,9 @@ mod tests {
     #[test]
     fn prepared_connector_debug_does_not_disclose_private_path() {
         let prepared = PreparedConnector {
-            configuration_file: "/private/host/config.yml".into(),
+            authentication: ConnectorAuthentication::CredentialConfiguration(
+                "/private/host/config.yml".into(),
+            ),
         };
         assert!(!format!("{prepared:?}").contains("/private/host"));
     }
@@ -827,7 +961,9 @@ mod tests {
         let error = ConnectorSupervisor::start(
             &profile,
             &PreparedConnector {
-                configuration_file: root.join("private-config.yml"),
+                authentication: ConnectorAuthentication::CredentialConfiguration(
+                    root.join("private-config.yml"),
+                ),
             },
             &AtomicBool::new(false),
         )
@@ -852,6 +988,68 @@ mod tests {
                 .unwrap()
                 .starts_with("unset|")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_token_connector_uses_a_private_token_file_without_local_ingress_or_secret_argv() {
+        let root = temporary_directory();
+        let arguments = root.join("arguments");
+        let environment = root.join("environment");
+        let executable = root.join("fake-cloudflared");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s|%s|%s\\n' \"${{HOME-unset}}\" \"${{PATH-unset}}\" \"${{TUNNEL_TOKEN-unset}}\" > {}\nexit 1\n",
+                arguments.display(),
+                environment.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = CloudflaredConfig {
+            executable,
+            ..remote_profile()
+        };
+        let paths = HostPaths {
+            config_file: root.join("config/agent-handover/config.toml"),
+            state_directory: root.join("state"),
+        };
+        let connector = prepare_remote(&profile, &paths).unwrap();
+        let ConnectorAuthentication::RemoteTokenFile(token_file) = &connector.authentication else {
+            panic!("remote profile must prepare a token file");
+        };
+        assert_eq!(fs::read_to_string(token_file).unwrap(), "connector-token");
+        assert_eq!(fs::metadata(token_file).unwrap().mode() & 0o777, 0o600);
+        assert!(
+            !paths
+                .state_directory
+                .join("cloudflared")
+                .join(CONFIGURATION_FILE)
+                .exists()
+        );
+
+        assert_eq!(
+            ConnectorSupervisor::start(&profile, &connector, &AtomicBool::new(false))
+                .err()
+                .unwrap(),
+            "managed Cloudflare tunnel exited before becoming ready"
+        );
+        let arguments = fs::read_to_string(arguments).unwrap();
+        assert!(!arguments.contains("connector-token"));
+        assert_eq!(arguments.lines().collect::<Vec<_>>()[0], "--metrics");
+        assert_eq!(
+            arguments.lines().skip(2).collect::<Vec<_>>(),
+            [
+                "tunnel",
+                "run",
+                "--token-file",
+                token_file.to_str().unwrap()
+            ]
+        );
+        let environment = fs::read_to_string(environment).unwrap();
+        assert!(environment.starts_with("unset|"));
+        assert!(environment.trim_end().ends_with("|unset"));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -893,7 +1091,9 @@ mod tests {
                 ConnectorSupervisor::start_at(
                     &profile,
                     &PreparedConnector {
-                        configuration_file: root.join("private-config.yml"),
+                        authentication: ConnectorAuthentication::CredentialConfiguration(
+                            root.join("private-config.yml"),
+                        ),
                     },
                     &metrics,
                     &cancelled,
@@ -935,12 +1135,128 @@ mod tests {
         ConnectorSupervisor::start_at(
             &profile,
             &PreparedConnector {
-                configuration_file: root.join("private-config.yml"),
+                authentication: ConnectorAuthentication::CredentialConfiguration(
+                    root.join("private-config.yml"),
+                ),
             },
             &metrics,
             &AtomicBool::new(false),
         )
         .unwrap()
+    }
+
+    fn start_fake_ready_remote_connector(root: &Path, keep_running: bool) -> ConnectorSupervisor {
+        let executable = root.join("fake-cloudflared");
+        let netcat = std::env::var("CLOUDFLARED_TEST_NC")
+            .expect("the Nix test environment must provide netcat");
+        let listener = if keep_running { "while :; do" } else { "" };
+        let suffix = if keep_running { "done &\nwait" } else { "" };
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nmetrics=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --metrics ]; then metrics=$2; fi\n  shift\ndone\nport=\"${{metrics##*:}}\"\n{listener} printf 'HTTP/1.0 200 OK\\r\\n\\r\\ncloudflared_tunnel_ha_connections 2\\n' | {netcat} -l 127.0.0.1 \"$port\"; {suffix}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = CloudflaredConfig {
+            executable,
+            ..remote_profile()
+        };
+        let paths = HostPaths {
+            config_file: root.join("config/agent-handover/config.toml"),
+            state_directory: root.join("state"),
+        };
+        let connector = prepare_remote(&profile, &paths).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let metrics = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        ConnectorSupervisor::start_at(&profile, &connector, &metrics, &AtomicBool::new(false))
+            .unwrap()
+    }
+
+    #[test]
+    fn remote_token_connector_reaches_readiness_and_cleans_up_its_group() {
+        let root = temporary_directory();
+        let supervisor = start_fake_ready_remote_connector(&root, true);
+        let pid = supervisor.process_group;
+        drop(supervisor);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_token_cancellation_during_readiness_reaps_the_fake_connector() {
+        let root = temporary_directory();
+        let pid_file = root.join("pid");
+        let executable = root.join("fake-cloudflared");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\necho $$ > {}\n/bin/sleep 60 & wait\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = CloudflaredConfig {
+            executable,
+            ..remote_profile()
+        };
+        let paths = HostPaths {
+            config_file: root.join("config/agent-handover/config.toml"),
+            state_directory: root.join("state"),
+        };
+        let connector = prepare_remote(&profile, &paths).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let metrics = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let cancelled = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(10));
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            assert_eq!(
+                ConnectorSupervisor::start_at(&profile, &connector, &metrics, &cancelled)
+                    .err()
+                    .unwrap(),
+                "managed Cloudflare tunnel enrollment cancelled"
+            );
+        });
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_token_timeout_cleanup_reaps_a_ready_fake_connector_group() {
+        let root = temporary_directory();
+        let supervisor = start_fake_ready_remote_connector(&root, true);
+        let pid = supervisor.process_group;
+        // The enrollment timeout drops the same supervisor capability.
+        drop(supervisor);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_token_connector_exit_after_readiness_is_observable_and_reaped() {
+        let root = temporary_directory();
+        let supervisor = start_fake_ready_remote_connector(&root, false);
+        let pid = supervisor.process_group;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !supervisor.exited().unwrap() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(supervisor.exited().unwrap());
+        drop(supervisor);
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
