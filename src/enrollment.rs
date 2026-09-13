@@ -54,6 +54,13 @@ pub(crate) struct Enrollment {
 
 type EnrollmentResultSender = oneshot::Sender<Result<String, String>>;
 
+#[derive(Clone, Copy)]
+pub(crate) enum TunnelGuidance {
+    External,
+    LocalConnectorReady,
+    RemoteIngressVerified,
+}
+
 impl Enrollment {
     pub(crate) fn callback_id(&self) -> Uuid {
         self.callback_id
@@ -163,7 +170,7 @@ pub async fn enroll<W: Write>(
         listener,
         store,
         rotate,
-        false,
+        TunnelGuidance::External,
         output,
     )
     .await
@@ -181,14 +188,14 @@ pub(crate) async fn enroll_with_listener<W: Write>(
     listener: TcpListener,
     store: &FileTokenStore,
     rotate: bool,
-    managed_connector: bool,
+    tunnel_guidance: TunnelGuidance,
     output: &mut W,
 ) -> Result<String, String> {
     let path = format!("{WEBHOOK_BASE_PATH}/{callback_id}");
     write!(
         output,
         "{}",
-        enrollment_guidance(hostname, &path, managed_connector)
+        enrollment_guidance(hostname, &path, tunnel_guidance)
     )
     .and_then(|()| output.flush())
     .map_err(|_| "cannot display webhook enrollment guidance".to_owned())?;
@@ -213,12 +220,18 @@ pub(crate) async fn enroll_with_listener<W: Write>(
     ))
 }
 
-fn enrollment_guidance(hostname: &str, path: &str, managed_connector: bool) -> String {
+fn enrollment_guidance(hostname: &str, path: &str, tunnel_guidance: TunnelGuidance) -> String {
     let callback_url = format!("https://{hostname}{path}");
-    let tunnel_guidance = if managed_connector {
-        "1. The configured locally managed Cloudflare Tunnel is ready for this callback:\n"
-    } else {
-        "1. Expose only this callback through an externally managed HTTPS tunnel:\n"
+    let tunnel_guidance = match tunnel_guidance {
+        TunnelGuidance::LocalConnectorReady => {
+            "1. The configured locally managed Cloudflare Tunnel is ready for this callback:\n"
+        }
+        TunnelGuidance::RemoteIngressVerified => {
+            "1. The configured remote Cloudflare Tunnel ingress was verified for this callback. Ensure its externally managed connector is running:\n"
+        }
+        TunnelGuidance::External => {
+            "1. Expose only this callback through an externally managed HTTPS tunnel:\n"
+        }
     };
     format!(
         "Notion webhook enrollment\n\
@@ -640,6 +653,18 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn remote_verified_guidance_does_not_claim_the_connector_is_ready() {
+        let guidance = enrollment_guidance(
+            "handover.example.test",
+            "/notion/webhook/00000000-0000-4000-8000-000000000070",
+            TunnelGuidance::RemoteIngressVerified,
+        );
+        assert!(guidance.contains("remote Cloudflare Tunnel ingress was verified"));
+        assert!(guidance.contains("externally managed connector is running"));
+        assert!(!guidance.contains("locally managed Cloudflare Tunnel is ready"));
+    }
+
     #[tokio::test]
     async fn loopback_flow_prints_exact_url_persists_then_exits() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -654,7 +679,7 @@ mod tests {
             listener,
             &store,
             false,
-            false,
+            TunnelGuidance::External,
             &mut output,
         );
         let client = async {

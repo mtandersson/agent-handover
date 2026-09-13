@@ -1,10 +1,13 @@
 use crate::config::{CloudflaredConfig, HostPaths, RunnerConfig, ensure_private_directory};
+use serde::Deserialize;
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -15,6 +18,160 @@ const CONFIGURATION_FILE: &str = "cloudflared-config.yml";
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL: Duration = Duration::from_millis(50);
 const MAX_METRICS_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Read-only boundary for the remote-tunnel configuration API.  It deliberately
+/// has no mutation operation: enrollment may prove ingress, never establish it.
+pub(crate) trait RemoteTunnelConfiguration {
+    fn get<'a>(
+        &'a self,
+        account_id: &'a str,
+        tunnel_id: &'a str,
+        api_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteTunnelConfig, String>> + Send + 'a>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteTunnelConfig {
+    pub(crate) ingress: Vec<RemoteIngress>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteIngress {
+    pub(crate) hostname: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) service: String,
+}
+
+pub(crate) struct CloudflareApi {
+    client: reqwest::Client,
+}
+impl CloudflareApi {
+    pub(crate) fn new() -> Result<Self, String> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|_| "cannot configure Cloudflare verification".to_owned())?,
+        })
+    }
+}
+impl RemoteTunnelConfiguration for CloudflareApi {
+    fn get<'a>(
+        &'a self,
+        account_id: &'a str,
+        tunnel_id: &'a str,
+        api_token: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteTunnelConfig, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!(
+                "https://api.cloudflare.com/client/v4/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations"
+            );
+            let mut response = self
+                .client
+                .get(url)
+                .bearer_auth(api_token)
+                .send()
+                .await
+                .map_err(|_| "cannot retrieve remote Cloudflare tunnel configuration".to_owned())?;
+            if !response.status().is_success() {
+                return Err("cannot retrieve remote Cloudflare tunnel configuration".to_owned());
+            }
+            if response
+                .content_length()
+                .is_some_and(|length| length > 1024 * 1024)
+            {
+                return Err("remote Cloudflare tunnel configuration is oversized".to_owned());
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| "cannot retrieve remote Cloudflare tunnel configuration".to_owned())?
+            {
+                if bytes.len().saturating_add(chunk.len()) > 1024 * 1024 {
+                    return Err("remote Cloudflare tunnel configuration is oversized".to_owned());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            parse_remote_configuration(&bytes)
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ApiResponse {
+    success: bool,
+    result: ApiResult,
+}
+#[derive(Deserialize)]
+struct ApiResult {
+    config: ApiConfig,
+}
+#[derive(Deserialize)]
+struct ApiConfig {
+    ingress: Vec<ApiIngress>,
+}
+#[derive(Deserialize)]
+struct ApiIngress {
+    hostname: Option<String>,
+    path: Option<String>,
+    service: String,
+}
+fn parse_remote_configuration(bytes: &[u8]) -> Result<RemoteTunnelConfig, String> {
+    let response: ApiResponse = serde_json::from_slice(bytes)
+        .map_err(|_| "remote Cloudflare tunnel configuration is malformed".to_owned())?;
+    if !response.success {
+        return Err("remote Cloudflare tunnel configuration was rejected".to_owned());
+    }
+    Ok(RemoteTunnelConfig {
+        ingress: response
+            .result
+            .config
+            .ingress
+            .into_iter()
+            .map(|rule| RemoteIngress {
+                hostname: rule.hostname,
+                path: rule.path,
+                service: rule.service,
+            })
+            .collect(),
+    })
+}
+
+pub(crate) async fn verify_remote_ingress<C: RemoteTunnelConfiguration>(
+    client: &C,
+    profile: &CloudflaredConfig,
+    runner: &RunnerConfig,
+    callback_id: Uuid,
+) -> Result<(), String> {
+    let (Some(account_id), Some(api_token), Some(_token)) =
+        (&profile.account_id, &profile.api_token, &profile.token)
+    else {
+        return Err("remote Cloudflare tunnel verification is not configured".to_owned());
+    };
+    let config = client
+        .get(account_id, &profile.tunnel_id, api_token)
+        .await?;
+    let expected_path = format!("^{}/{}$", runner.webhook_path, callback_id);
+    let expected_service = format!("http://{}", runner.bind_address);
+    let [route, fallback] = config.ingress.as_slice() else {
+        return Err(
+            "remote Cloudflare tunnel ingress does not restrict the webhook callback".to_owned(),
+        );
+    };
+    if route.hostname.as_deref() != Some(profile.hostname.as_str())
+        || route.path.as_deref() != Some(expected_path.as_str())
+        || route.service != expected_service
+        || fallback.hostname.is_some()
+        || fallback.path.is_some()
+        || fallback.service != "http_status:404"
+    {
+        return Err(
+            "remote Cloudflare tunnel ingress does not restrict the webhook callback".to_owned(),
+        );
+    }
+    Ok(())
+}
 
 /// The one enrollment-time cloudflared child. It has its own process group so
 /// cleanup includes descendants created by the connector.
@@ -207,7 +364,10 @@ pub(crate) fn prepare(
     runner: &RunnerConfig,
     callback_id: Uuid,
 ) -> Result<PreparedConnector, String> {
-    let credentials_file = &profile.credentials_file;
+    let credentials_file = profile
+        .credentials_file
+        .as_ref()
+        .ok_or_else(|| "managed Cloudflare tunnel credentials are unavailable".to_owned())?;
     let private_configuration_directory = paths
         .config_file
         .parent()
@@ -248,7 +408,10 @@ fn render(profile: &CloudflaredConfig, runner: &RunnerConfig, callback_id: Uuid)
     // Configured hostnames are validated as DNS names and UUIDs have a fixed
     // syntax, so these values cannot introduce YAML structure.
     let credentials = {
-        let path = &profile.credentials_file;
+        let path = profile
+            .credentials_file
+            .as_ref()
+            .expect("credential mode was checked before rendering");
         // The path is intentionally written only to a 0600 generated file.
         // JSON strings are valid YAML scalars. This protects the entire
         // host-derived path, not only the credential filename.
@@ -329,7 +492,10 @@ mod tests {
             executable: "cloudflared".into(),
             hostname: "handover.example.test".into(),
             tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
-            credentials_file,
+            credentials_file: Some(credentials_file),
+            token: None,
+            account_id: None,
+            api_token: None,
         }
     }
 
@@ -340,6 +506,73 @@ mod tests {
             webhook_path: "/notion/webhook".into(),
             health_path: "/health".into(),
         }
+    }
+
+    struct FakeRemote(Result<RemoteTunnelConfig, String>);
+    impl RemoteTunnelConfiguration for FakeRemote {
+        fn get<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<RemoteTunnelConfig, String>> + Send + 'a>> {
+            Box::pin(async move { self.0.clone() })
+        }
+    }
+    fn remote_profile() -> CloudflaredConfig {
+        CloudflaredConfig {
+            executable: "cloudflared".into(),
+            hostname: "handover.example.test".into(),
+            tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
+            credentials_file: None,
+            token: Some("connector-token".into()),
+            account_id: Some("0123456789abcdef0123456789abcdef".into()),
+            api_token: Some("read-token".into()),
+        }
+    }
+    #[tokio::test]
+    async fn accepts_only_the_exact_remote_callback_route_and_non_forwarding_fallback() {
+        let callback = Uuid::parse_str("00000000-0000-4000-8000-000000000078").unwrap();
+        let remote = FakeRemote(Ok(RemoteTunnelConfig {
+            ingress: vec![
+                RemoteIngress {
+                    hostname: Some("handover.example.test".into()),
+                    path: Some("^/notion/webhook/00000000-0000-4000-8000-000000000078$".into()),
+                    service: "http://127.0.0.1:8080".into(),
+                },
+                RemoteIngress {
+                    hostname: None,
+                    path: None,
+                    service: "http_status:404".into(),
+                },
+            ],
+        }));
+        verify_remote_ingress(&remote, &remote_profile(), &runner(), callback)
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn rejects_remote_ingress_that_can_forward_another_callback_path() {
+        let remote = FakeRemote(Ok(RemoteTunnelConfig {
+            ingress: vec![
+                RemoteIngress {
+                    hostname: Some("handover.example.test".into()),
+                    path: Some("^/notion/webhook/.*$".into()),
+                    service: "http://127.0.0.1:8080".into(),
+                },
+                RemoteIngress {
+                    hostname: None,
+                    path: None,
+                    service: "http_status:404".into(),
+                },
+            ],
+        }));
+        assert_eq!(
+            verify_remote_ingress(&remote, &remote_profile(), &runner(), Uuid::nil())
+                .await
+                .unwrap_err(),
+            "remote Cloudflare tunnel ingress does not restrict the webhook callback"
+        );
     }
 
     #[test]
@@ -586,7 +819,10 @@ mod tests {
             executable,
             hostname: "handover.example.test".into(),
             tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
-            credentials_file: root.join("credentials.json"),
+            credentials_file: Some(root.join("credentials.json")),
+            token: None,
+            account_id: None,
+            api_token: None,
         };
         let error = ConnectorSupervisor::start(
             &profile,
@@ -639,7 +875,10 @@ mod tests {
             executable,
             hostname: "handover.example.test".into(),
             tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
-            credentials_file: root.join("credentials.json"),
+            credentials_file: Some(root.join("credentials.json")),
+            token: None,
+            account_id: None,
+            api_token: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let metrics = listener.local_addr().unwrap().to_string();
@@ -685,7 +924,10 @@ mod tests {
             executable,
             hostname: "handover.example.test".into(),
             tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
-            credentials_file: root.join("credentials.json"),
+            credentials_file: Some(root.join("credentials.json")),
+            token: None,
+            account_id: None,
+            api_token: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let metrics = listener.local_addr().unwrap().to_string();

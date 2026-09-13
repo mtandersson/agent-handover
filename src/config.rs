@@ -365,7 +365,10 @@ pub struct CloudflaredConfig {
     pub executable: PathBuf,
     pub hostname: String,
     pub tunnel_id: String,
-    pub credentials_file: PathBuf,
+    pub credentials_file: Option<PathBuf>,
+    pub token: Option<String>,
+    pub account_id: Option<String>,
+    pub api_token: Option<String>,
 }
 
 impl fmt::Debug for CloudflaredConfig {
@@ -376,7 +379,18 @@ impl fmt::Debug for CloudflaredConfig {
             .field("hostname", &"<redacted>")
             .field("tunnel_id", &"<redacted>")
             .field("credentials_file", &"<redacted>")
+            .field("token", &"<redacted>")
+            .field("account_id", &"<redacted>")
+            .field("api_token", &"<redacted>")
             .finish()
+    }
+}
+
+impl CloudflaredConfig {
+    /// Remote token profiles are verified against Cloudflare and must never be
+    /// supplied with a generated local ingress file.
+    pub(crate) fn uses_remote_configuration(&self) -> bool {
+        self.token.is_some()
     }
 }
 
@@ -781,12 +795,20 @@ fn validate_cloudflared(config: &CloudflaredConfig) -> Result<(), String> {
     if uuid::Uuid::parse_str(&config.tunnel_id).is_err() {
         return Err("configuration field cloudflared.tunnel_id must be a UUID".to_owned());
     }
-    if !config.credentials_file.is_absolute() {
-        return Err(
-            "configuration field cloudflared.credentials_file must be an absolute path".to_owned(),
-        );
+    match (&config.credentials_file, &config.token, &config.account_id, &config.api_token) {
+        (Some(credentials), None, None, None) if credentials.is_absolute() => {}
+        (Some(_), None, None, None) => return Err("configuration field cloudflared.credentials_file must be an absolute path".to_owned()),
+        (None, Some(token), Some(account), Some(api_token)) if valid_secret(token) && valid_secret(api_token) && valid_account_id(account) => {}
+        _ => return Err("configure either cloudflared.credentials_file or cloudflared.token, account_id, and api_token".to_owned()),
     }
     Ok(())
+}
+
+fn valid_secret(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_graphic())
+}
+fn valid_account_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|c| c.is_ascii_hexdigit())
 }
 
 pub(crate) fn resolve_executable(executable: &Path) -> Option<PathBuf> {
@@ -938,10 +960,25 @@ health_path = "/health"
         );
         let paths = write_fixture(&second_root, &(fixture().to_owned() + &unsupported), 0o600);
         let error = load(&paths).unwrap_err();
-        assert!(error.contains("invalid configuration file"));
+        assert!(error.contains("configure either cloudflared.credentials_file"));
         assert!(!error.contains("secret-token"));
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn remote_token_profile_selects_remote_configuration_without_credentials() {
+        let profile = CloudflaredConfig {
+            executable: "cloudflared".into(),
+            hostname: "handover.example.test".into(),
+            tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
+            credentials_file: None,
+            token: Some("connector-token".into()),
+            account_id: Some("0123456789abcdef0123456789abcdef".into()),
+            api_token: Some("read-token".into()),
+        };
+        assert!(profile.uses_remote_configuration());
+        assert!(profile.credentials_file.is_none());
     }
 
     #[test]

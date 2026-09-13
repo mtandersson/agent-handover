@@ -22,6 +22,10 @@ mod state;
 
 static ENROLLMENT_CANCELLED: AtomicBool = AtomicBool::new(false);
 
+fn requires_local_connector_preparation(profile: Option<&config::CloudflaredConfig>) -> bool {
+    profile.is_some_and(|profile| !profile.uses_remote_configuration())
+}
+
 extern "C" fn request_enrollment_cancellation(_: libc::c_int) {
     ENROLLMENT_CANCELLED.store(true, Ordering::Relaxed);
 }
@@ -194,6 +198,20 @@ fn main() -> ExitCode {
                         }
                         store.ensure_available(rotate)?;
                         let callback_id = uuid::Uuid::new_v4();
+                        if profile.uses_remote_configuration() {
+                            return runtime.block_on(async {
+                                let listener = enrollment::bind_listener().await?;
+                                let api = cloudflare::CloudflareApi::new()?;
+                                cloudflare::verify_remote_ingress(
+                                    &api, &profile, &runner, callback_id,
+                                ).await?;
+                                let stdout = io::stdout();
+                                let mut output = stdout.lock();
+                                enrollment::enroll_with_listener(
+                                    &hostname, callback_id, listener, &store, rotate, enrollment::TunnelGuidance::RemoteIngressVerified, &mut output,
+                                ).await
+                            });
+                        } else {
                             return runtime.block_on(async {
                             let listener = enrollment::bind_listener().await?;
                             let connector = cloudflare::prepare(
@@ -216,7 +234,7 @@ fn main() -> ExitCode {
                                 listener,
                                 &store,
                                 rotate,
-                                true,
+                                enrollment::TunnelGuidance::LocalConnectorReady,
                                 &mut output,
                             );
                             tokio::pin!(enrollment);
@@ -240,6 +258,7 @@ fn main() -> ExitCode {
                             });
                         }
                         }
+                        }
                         Err(_) if config::cloudflared_is_configured(&paths)? => {
                             return Err("cannot load managed Cloudflare tunnel profile".to_owned());
                         }
@@ -252,7 +271,8 @@ fn main() -> ExitCode {
         Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {
             config::load(&paths).and_then(|config| match command {
                 Command::Serve => {
-                    if let Some(cloudflared) = &config.cloudflared {
+                    if requires_local_connector_preparation(config.cloudflared.as_ref()) {
+                        let cloudflared = config.cloudflared.as_ref().expect("profile was checked");
                         let enrollment =
                             enrollment::FileTokenStore::new(paths.state_directory.clone())
                                 .load()?;
@@ -336,7 +356,11 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Invocation, help, parse_command, run_once_response, usage};
+    use super::{
+        Command, Invocation, help, parse_command, requires_local_connector_preparation,
+        run_once_response, usage,
+    };
+    use crate::config::CloudflaredConfig;
 
     #[test]
     fn shows_help_without_arguments_or_with_help_flags() {
@@ -409,5 +433,28 @@ mod tests {
             run_once_response(3),
             "run-once reconciled 3 Pending task(s)"
         );
+    }
+
+    #[test]
+    fn serve_prepares_local_ingress_only_for_credential_file_profiles() {
+        let remote = CloudflaredConfig {
+            executable: "cloudflared".into(),
+            hostname: "handover.example.test".into(),
+            tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
+            credentials_file: None,
+            token: Some("connector-token".into()),
+            account_id: Some("0123456789abcdef0123456789abcdef".into()),
+            api_token: Some("read-token".into()),
+        };
+        let local = CloudflaredConfig {
+            credentials_file: Some("/private/credentials.json".into()),
+            token: None,
+            account_id: None,
+            api_token: None,
+            ..remote.clone()
+        };
+        assert!(!requires_local_connector_preparation(Some(&remote)));
+        assert!(requires_local_connector_preparation(Some(&local)));
+        assert!(!requires_local_connector_preparation(None));
     }
 }

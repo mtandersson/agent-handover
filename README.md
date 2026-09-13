@@ -312,6 +312,13 @@ tunnel_id = "<EXISTING_TUNNEL_UUID>"
 credentials_file = "/absolute/XDG_CONFIG_HOME/agent-handover/<EXISTING_TUNNEL_UUID>.json"
 ```
 
+For a remotely managed token tunnel, replace `credentials_file` with the
+connector `token`, its Cloudflare `account_id`, and a separate least-privilege
+read-only `api_token`. Before enrollment accepts the callback, the runner reads
+the remote configuration and requires exactly the generated callback route to
+the loopback listener followed by `http_status:404`. It never writes Cloudflare
+configuration. Token-tunnel process supervision is configured separately.
+
 Supported sandbox values are `read-only`, `workspace-write`, and
 `danger-full-access`; the runner passes the configured policy through without
 weakening it. The required `[codex]` table is the private executor selection for
