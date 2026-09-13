@@ -5,8 +5,6 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use enrollment::EnrollmentSource;
-
 mod cloudflare;
 mod config;
 mod coordination;
@@ -21,10 +19,6 @@ mod serving;
 mod state;
 
 static ENROLLMENT_CANCELLED: AtomicBool = AtomicBool::new(false);
-
-fn requires_local_connector_preparation(profile: Option<&config::CloudflaredConfig>) -> bool {
-    profile.is_some_and(|profile| !profile.uses_remote_configuration())
-}
 
 extern "C" fn request_enrollment_cancellation(_: libc::c_int) {
     ENROLLMENT_CANCELLED.store(true, Ordering::Relaxed);
@@ -305,36 +299,22 @@ fn main() -> ExitCode {
         }
         Ok(Invocation::Command(command)) => config::HostPaths::discover().and_then(|paths| {
             config::load(&paths).and_then(|config| match command {
-                Command::Serve => {
-                    if requires_local_connector_preparation(config.cloudflared.as_ref()) {
-                        let cloudflared = config.cloudflared.as_ref().expect("profile was checked");
-                        let enrollment =
-                            enrollment::FileTokenStore::new(paths.state_directory.clone())
-                                .load()?;
-                        cloudflare::prepare(
-                            cloudflared,
-                            &paths,
-                            &config.runner,
-                            enrollment.callback_id(),
-                        )?;
-                    }
-                    notion::NotionHttpClient::new(
+                Command::Serve => notion::NotionHttpClient::new(
+                    &config.notion,
+                    &config.task_properties,
+                    &config.journal_properties,
+                    &config.journal_values,
+                )
+                .and_then(|notion| {
+                    serving::serve(
+                        &config,
+                        &enrollment::FileTokenStore::new(paths.state_directory.clone()),
+                        paths,
+                        notion,
                         &config.notion,
-                        &config.task_properties,
-                        &config.journal_properties,
-                        &config.journal_values,
+                        &config.task_values,
                     )
-                    .and_then(|notion| {
-                        serving::serve(
-                            &config,
-                            &enrollment::FileTokenStore::new(paths.state_directory.clone()),
-                            paths.state_directory,
-                            notion,
-                            &config.notion,
-                            &config.task_values,
-                        )
-                    })
-                }
+                }),
                 Command::RunOnce => notion::NotionHttpClient::new(
                     &config.notion,
                     &config.task_properties,
@@ -391,11 +371,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Command, Invocation, help, parse_command, requires_local_connector_preparation,
-        run_once_response, usage,
-    };
-    use crate::config::CloudflaredConfig;
+    use super::{Command, Invocation, help, parse_command, run_once_response, usage};
 
     #[test]
     fn shows_help_without_arguments_or_with_help_flags() {
@@ -468,28 +444,5 @@ mod tests {
             run_once_response(3),
             "run-once reconciled 3 Pending task(s)"
         );
-    }
-
-    #[test]
-    fn serve_prepares_local_ingress_only_for_credential_file_profiles() {
-        let remote = CloudflaredConfig {
-            executable: "cloudflared".into(),
-            hostname: "handover.example.test".into(),
-            tunnel_id: "00000000-0000-4000-8000-000000000079".into(),
-            credentials_file: None,
-            token: Some("connector-token".into()),
-            account_id: Some("0123456789abcdef0123456789abcdef".into()),
-            api_token: Some("read-token".into()),
-        };
-        let local = CloudflaredConfig {
-            credentials_file: Some("/private/credentials.json".into()),
-            token: None,
-            account_id: None,
-            api_token: None,
-            ..remote.clone()
-        };
-        assert!(!requires_local_connector_preparation(Some(&remote)));
-        assert!(requires_local_connector_preparation(Some(&local)));
-        assert!(!requires_local_connector_preparation(None));
     }
 }

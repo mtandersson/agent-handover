@@ -240,10 +240,12 @@ ingress:
 The `path` value is an anchored regular expression so it matches only the
 generated endpoint. The `<PORT>` must match the listener (currently `8080`).
 The final catch-all rule prevents the tunnel from exposing other local routes
-and is required by `cloudflared`. Start the connector before creating the
-Notion subscription and keep it running with `serve`. Cloudflare Tunnel is one
-option; any externally managed tunnel is acceptable if it preserves the exact
-public path and forwards the unmodified body and `X-Notion-Signature` header.
+and is required by `cloudflared`. A configured `[cloudflared]` profile is
+started and supervised by `serve`; otherwise start the connector before
+creating the Notion subscription and keep it running with `serve`. Cloudflare
+Tunnel is one option; any externally managed tunnel is acceptable if it
+preserves the exact public path and forwards the unmodified body and
+`X-Notion-Signature` header.
 
 ## Private host configuration
 
@@ -356,13 +358,16 @@ the pair in one rename, so the values cannot come from different enrollments.
 The optional `[cloudflared]` profile selects an already provisioned named
 tunnel. Its hostname is validated locally and it requires a mode-`0600`
 credential file placed directly in the private XDG configuration directory.
-During `webhook-enroll`, that profile starts `cloudflared` with a
+During `webhook-enroll` and `serve`, that profile starts `cloudflared` with a
 private generated ingress configuration and a loopback-only metrics endpoint.
-The runner waits for an active HA connection before printing the Notion steps,
-then terminates and reaps the connector when enrollment ends. The generated
-configuration routes only the enrolled callback UUID to the configured
-loopback origin and ends in an HTTP 404 catch-all. The runner never creates or
-changes Cloudflare account resources.
+The runner waits for an active HA connection before printing the Notion steps
+or accepting HTTP intake. It terminates and reaps the connector process group
+when enrollment or serving ends; an unexpected connector exit stops serving.
+The generated configuration routes only the enrolled callback UUID to the
+configured loopback origin and ends in an HTTP 404 catch-all. The runner never
+creates or changes Cloudflare account resources. Remote token profiles verify
+the same ingress with Cloudflare before serving and use the private token file,
+not a local ingress configuration.
 
 ## Commands
 
