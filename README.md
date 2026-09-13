@@ -69,6 +69,7 @@ examples:
 
 ```sh
 agent-handover --help
+agent-handover webhook-enroll --help
 ```
 
 The normal operator sequence is:

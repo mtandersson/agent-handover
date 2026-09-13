@@ -71,6 +71,7 @@ enum Command {
 enum Invocation {
     Command(Command),
     Help,
+    CommandHelp(&'static str),
     Version,
 }
 
@@ -78,6 +79,17 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
     match args {
         [] => Ok(Invocation::Help),
         [flag] if flag == "--help" || flag == "-h" => Ok(Invocation::Help),
+        [command, flag]
+            if matches!(command.as_str(), "serve" | "run-once" | "webhook-enroll")
+                && (flag == "--help" || flag == "-h") =>
+        {
+            Ok(Invocation::CommandHelp(match command.as_str() {
+                "serve" => "serve",
+                "run-once" => "run-once",
+                "webhook-enroll" => "webhook-enroll",
+                _ => unreachable!("guard limits command names"),
+            }))
+        }
         [command] if command == "serve" => Ok(Invocation::Command(Command::Serve)),
         [command] if command == "run-once" => Ok(Invocation::Command(Command::RunOnce)),
         [command, flag, hostname] if command == "webhook-enroll" && flag == "--hostname" => {
@@ -169,6 +181,59 @@ Examples:
 
 Use --version to print the installed version."#
         .to_owned()
+}
+
+fn command_help(command: &str) -> String {
+    match command {
+        "serve" => {
+            r#"Serve authenticated Notion webhooks and reconcile Pending tasks.
+
+Usage:
+  agent-handover serve
+
+The runner reconciles at startup and periodically while accepting health checks
+and authenticated webhook signals. Tasks execute sequentially. A configured
+host profile and enrolled webhook token are required.
+
+Options:
+  -h, --help  Print this help"#
+        }
+        "run-once" => {
+            r#"Reconcile and drain current Pending Notion tasks once.
+
+Usage:
+  agent-handover run-once
+
+Tasks execute sequentially using the configured host profile. A webhook token
+and public tunnel are not required.
+
+Options:
+  -h, --help  Print this help"#
+        }
+        "webhook-enroll" => {
+            r#"Enroll a Notion connection webhook token on this host.
+
+Usage:
+  agent-handover webhook-enroll --hostname <HOST> [--rotate]
+
+Arguments:
+  --hostname <HOST>  Public DNS hostname without a scheme, port, path, or
+                     credentials
+
+Options:
+  --rotate     Replace an existing enrollment after verification succeeds
+  -h, --help   Print this help
+
+The command prints a secret callback URL and listens on 127.0.0.1:8080 for one
+Notion verification request. Nothing is persisted until verification succeeds.
+See README.md for tunnel modes and the complete enrollment procedure.
+
+Example:
+  agent-handover webhook-enroll --hostname handover.example.com"#
+        }
+        _ => unreachable!("only parsed command names have command help"),
+    }
+    .to_owned()
 }
 
 fn run_once_response(count: usize) -> String {
@@ -364,6 +429,7 @@ fn main() -> ExitCode {
             })
         }),
         Ok(Invocation::Help) => Ok(help()),
+        Ok(Invocation::CommandHelp(command)) => Ok(command_help(command)),
         Ok(Invocation::Version) => Ok(format!("agent-handover {}", env!("CARGO_PKG_VERSION"))),
         Err(error) => Err(error),
     };
@@ -382,7 +448,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, Invocation, help, parse_command, run_once_response, usage};
+    use super::{Command, Invocation, command_help, help, parse_command, run_once_response, usage};
 
     #[test]
     fn shows_help_without_arguments_or_with_help_flags() {
@@ -408,6 +474,27 @@ mod tests {
             Ok(Invocation::Version)
         );
         assert_eq!(parse_command(&["-V".to_owned()]), Ok(Invocation::Version));
+    }
+
+    #[test]
+    fn shows_help_for_each_command_with_either_help_flag() {
+        for command in ["serve", "run-once", "webhook-enroll"] {
+            let expected = Invocation::CommandHelp(command);
+            assert_eq!(
+                parse_command(&[command.to_owned(), "-h".to_owned()]),
+                Ok(expected.clone())
+            );
+            assert_eq!(
+                parse_command(&[command.to_owned(), "--help".to_owned()]),
+                Ok(expected)
+            );
+            assert!(command_help(command).contains(&format!("agent-handover {command}")));
+        }
+
+        let enrollment_help = command_help("webhook-enroll");
+        assert!(enrollment_help.contains("--hostname <HOST>"));
+        assert!(enrollment_help.contains("--rotate"));
+        assert!(enrollment_help.contains("127.0.0.1:8080"));
     }
 
     #[test]
