@@ -122,18 +122,26 @@ not put them in this repository.
 Create the connection and share the task and journal data sources before
 enrollment. Then complete the webhook subscription as follows:
 
-1. Arrange an externally managed tunnel from the public HTTPS hostname to
-   `http://127.0.0.1:8080`. The tunnel must route only the secret callback path
-   printed in the next step; the [Cloudflare example](#external-tunnel) can be
-   filled in once the UUID is known.
+1. Choose the tunnel lifecycle described under
+   [Cloudflare Tunnel choices](#cloudflare-tunnel-choices). For managed
+   credential-file mode, provision the named tunnel and hostname and add its
+   `[cloudflared]` profile before enrollment. For remote-token mode or manual
+   fallback, omit `[cloudflared]` during enrollment; the callback UUID must be
+   printed before the operator can configure its exact route.
 2. Run `agent-handover webhook-enroll --hostname handover.example.com`, using
    only the public DNS hostname (without a scheme, port, path, or credentials).
-   The command validates the hostname locally without resolving it and does not
-   require `config.toml`.
+   The command validates the hostname locally without resolving it. A host
+   profile is optional, but a valid credential-file profile makes the runner
+   generate restricted ingress, start the connector, and wait for an active
+   connection before continuing.
 3. Keep the command running. It generates a random UUID and prints the exact
    `https://<HOST>/notion/webhook/<UUID>` URL, plus links to
    [Notion Connections][notion-connections] and the [webhook setup
    guide][notion-webhooks]. Nothing is persisted until verification succeeds.
+   In remote-token mode, now configure that exact dashboard route and start the
+   connector manually. With manual fallback, now configure and start the
+   external tunnel. Both must route only the printed callback to
+   `http://127.0.0.1:8080` and use a 404 catch-all.
 4. In the connection's **Webhooks** tab, create a subscription using that exact
    URL, Notion API version `2026-03-11`, and these event types:
 
@@ -146,14 +154,19 @@ enrollment. Then complete the webhook subscription as follows:
    the exact UUID-bearing path, atomically stores the callback UUID and token,
    prints the token once, and exits.
 6. Back in Notion, choose **Verify**, paste the printed token, and activate the
-   subscription. Start `agent-handover serve` only after verification and keep
-   the external tunnel running beside it.
+   subscription. The enrollment command then exits and reaps its managed
+   credential-file connector. Start `agent-handover serve` only after
+   verification. It starts a fresh managed connector when `[cloudflared]` is
+   configured; otherwise keep the externally supervised connector running.
 
 Repeat enrollment is refused. To replace an enrollment, delete the verified
 Notion subscription (Notion does not allow its URL to be changed), run
-`webhook-enroll --hostname <HOST> --rotate`, update the tunnel route to the new
-printed path, and create and verify a new subscription. The old UUID and token
-remain paired until the replacement verification succeeds.
+`webhook-enroll --hostname <HOST> --rotate`, and create and verify a new
+subscription. Credential-file mode generates and supervises the replacement
+route automatically. For remote-token mode or manual fallback, omit
+`[cloudflared]` during rotation and update the externally managed route to the
+new printed path while the command waits. The old UUID and token remain paired
+until replacement verification succeeds.
 
 Normal webhook requests are authenticated
 from the exact raw body using the `X-Notion-Signature` HMAC. Events are only
@@ -215,16 +228,45 @@ supervisors. Duplicate deliveries subscribe to their existing supervisor
 without consuming another slot, while excess unique events wait without
 claiming event or page state.
 
-#### External tunnel
+#### Cloudflare Tunnel choices
 
-Notion requires a public HTTPS webhook URL and cannot reach localhost. Tunnel
-provisioning and DNS remain external to `agent-handover`. Without a
-credential-file `[cloudflared]` profile, configuration and process supervision
-also remain external. For example, a [locally managed Cloudflare
-Tunnel][cloudflare-tunnel] can route only the generated callback path to the
-loopback-bound runner. Supply the existing tunnel's UUID and credentials, and
-replace `<CALLBACK_UUID>` with the value shown by `webhook-enroll`; never commit
-the resulting private configuration:
+Notion requires a public HTTPS webhook URL and cannot reach localhost. The
+operator owns the Cloudflare account resources: install
+[`cloudflared`][cloudflare-install], create the named tunnel and public
+hostname, and obtain only the credential needed by the runner host. Creating a
+tunnel, changing DNS, assigning public hostnames, and changing dashboard
+ingress are never actions `agent-handover` takes.
+
+The optional `[cloudflared]` host-profile table instead asks the runner to
+supervise an already-provisioned connector while `webhook-enroll` and `serve`
+run. Choose one of these delivery modes:
+
+- **Credential-file mode** uses a tunnel-specific JSON credential. The runner
+  writes a private local ingress configuration with exactly the enrolled
+  callback and a 404 catch-all, then starts and stops `cloudflared` as its
+  child. This is the managed flow for enrollment and rotation.
+- **Remote-token mode** uses a dashboard-managed tunnel token. The operator
+  configures the dashboard ingress; before starting, the runner reads it using
+  a separately supplied account API token and rejects anything other than the
+  exact callback route and 404 catch-all. The runner never writes local ingress
+  in this mode. Because a callback ID is generated during enrollment, initial
+  enrollment and every rotation use the manual flow below; add the remote-token
+  profile only after the dashboard route matches the stored callback.
+- **Manual fallback** omits `[cloudflared]`. The operator starts and supervises
+  any tunnel implementation and keeps its routing configuration outside this
+  project. This remains supported for all lifecycle operations.
+
+For a locally managed credential-file tunnel, Cloudflare's
+[named-tunnel guide][cloudflare-named-tunnel] explains installation and
+creation. Move only the resulting tunnel JSON credential (not the account-wide
+`cert.pem`) directly into the private `agent-handover` configuration directory,
+with mode `0600`; Cloudflare explains the different scopes in its
+[tunnel-permissions guide][cloudflare-tunnel-permissions]. The runner requires
+that placement and permission, generates its own mode-`0600` configuration
+under its private state directory, and does not expose either file in logs.
+
+For reference, the runner-generated credential-file ingress has this shape. It
+is not an operator-maintained file and all values shown are placeholders:
 
 ```yaml
 tunnel: <TUNNEL_UUID>
@@ -239,13 +281,19 @@ ingress:
 
 The `path` value is an anchored regular expression so it matches only the
 generated endpoint. The `<PORT>` must match the listener (currently `8080`).
-The final catch-all rule prevents the tunnel from exposing other local routes
-and is required by `cloudflared`. A configured `[cloudflared]` profile is
-started and supervised by `serve`; otherwise start the connector before
-creating the Notion subscription and keep it running with `serve`. Cloudflare
-Tunnel is one option; any externally managed tunnel is acceptable if it
-preserves the exact public path and forwards the unmodified body and
-`X-Notion-Signature` header.
+The final catch-all rule prevents the tunnel from exposing other local routes.
+For remote-token mode, configure that same two-rule ingress in the Cloudflare
+dashboard before adding the profile; the [remote-tunnel][cloudflare-remote-tunnel]
+and [tunnel-token][cloudflare-tunnel-tokens] guides describe those resources.
+Use a token that can run only that connector and a separate, least-privilege API
+token able to read its configuration. The remote token and API token both stay
+in the mode-`0600` host profile; the runner copies the connector token to a
+private mode-`0600` state file and passes it to `cloudflared` without putting it
+in command arguments or the child environment.
+
+With manual fallback, preserve the exact public path and forward the unmodified
+body and `X-Notion-Signature` header. Do not use a quick tunnel or a catch-all
+route that also exposes the runner's health endpoint.
 
 ## Private host configuration
 
@@ -314,15 +362,20 @@ tunnel_id = "<EXISTING_TUNNEL_UUID>"
 credentials_file = "/absolute/XDG_CONFIG_HOME/agent-handover/<EXISTING_TUNNEL_UUID>.json"
 ```
 
-For a remotely managed token tunnel, replace `credentials_file` with the
-connector `token`, its Cloudflare `account_id`, and a separate least-privilege
-read-only `api_token`. Before enrollment accepts the callback, the runner reads
-the remote configuration and requires exactly the generated callback route to
-the loopback listener followed by `http_status:404`. It never writes Cloudflare
-configuration. After that verification, it supervises `cloudflared` for the
-single enrollment window using its supported `--token-file` interface (requires
-cloudflared 2025.4.0 or later). The token is copied to a private state file so
-it never appears in process arguments or the connector environment; no local
+For a remotely managed token tunnel, replace `credentials_file` with all three
+private values below. First enroll manually and configure the dashboard's exact
+callback route; then add this profile. The runner reads and verifies that
+remote configuration before it starts `cloudflared`, but never writes it.
+
+```toml
+token = "<EXISTING_TUNNEL_TOKEN>"
+account_id = "<CLOUDFLARE_ACCOUNT_ID>"
+api_token = "<READ_TUNNEL_CONFIGURATION_API_TOKEN>"
+```
+
+Remote-token mode uses `cloudflared` 2025.4.0 or later and its supported
+`--token-file` interface. The token is copied to a private state file so it
+never appears in process arguments or the connector environment; no local
 ingress configuration is generated for token tunnels.
 
 Supported sandbox values are `read-only`, `workspace-write`, and
@@ -356,18 +409,22 @@ The callback UUID and webhook verification token are stored together at
 the pair in one rename, so the values cannot come from different enrollments.
 
 The optional `[cloudflared]` profile selects an already provisioned named
-tunnel. Its hostname is validated locally and it requires a mode-`0600`
-credential file placed directly in the private XDG configuration directory.
-During `webhook-enroll` and `serve`, that profile starts `cloudflared` with a
-private generated ingress configuration and a loopback-only metrics endpoint.
-The runner waits for an active HA connection before printing the Notion steps
-or accepting HTTP intake. It terminates and reaps the connector process group
-when enrollment or serving ends; an unexpected connector exit stops serving.
-The generated configuration routes only the enrolled callback UUID to the
-configured loopback origin and ends in an HTTP 404 catch-all. The runner never
-creates or changes Cloudflare account resources. Remote token profiles verify
-the same ingress with Cloudflare before serving and use the private token file,
-not a local ingress configuration.
+tunnel. Its hostname is validated locally. Credential-file mode requires a
+mode-`0600` credential file directly in the private XDG configuration directory
+and lets the runner generate restricted local ingress. Remote-token mode
+requires `token`, `account_id`, and `api_token` in the mode-`0600` host profile
+and leaves ingress in Cloudflare. In either mode, the runner waits for an
+active HA connection before accepting HTTP intake, terminates and reaps the
+connector process group when serving ends, and stops serving if the connector
+exits unexpectedly. Credential-file mode also starts a connector and waits for
+it before printing Notion steps during enrollment; remote-token enrollment and
+rotation use the manual flow because their exact callback route must be
+configured first.
+In credential-file mode, the generated configuration routes only the enrolled
+callback UUID to the configured loopback origin and ends in an HTTP 404
+catch-all. The runner never creates or changes Cloudflare account resources.
+Remote-token profiles verify the same ingress with Cloudflare before serving
+and use the private token file, not a local ingress configuration.
 
 ## Commands
 
@@ -510,6 +567,25 @@ duplicate effects.
 
 ## Troubleshooting
 
+- **Managed connector does not start:** verify the configured executable can
+  run, the named tunnel and hostname already exist, and credentials are in the
+  required private location. In remote-token mode, also verify the dashboard
+  ingress is exactly the enrolled hostname, callback path, loopback origin, and
+  404 fallback. Correct Cloudflare resources outside the runner, then rerun
+  `serve`; it performs startup reconciliation before accepting webhooks.
+- **Managed connector exits unexpectedly:** `serve` stops HTTP intake and
+  exits rather than continuing without its expected public route. Restore the
+  connector or use the manual fallback, then restart `serve`. The restart
+  performs safe local and Notion recovery but never automatically reruns an
+  agent action that crossed its launch boundary.
+- **Stopping or rotating a tunnel:** `SIGINT` and `SIGTERM` stop intake, drain
+  active safe preparation, and reap a runner-managed connector. For a
+  credential-file profile, run `webhook-enroll --rotate`; it writes the new
+  restricted local ingress while the command waits for Notion. For a
+  remote-token profile, temporarily use manual fallback: remove the profile,
+  run `webhook-enroll --rotate`, update the dashboard's exact callback ingress
+  while it waits, verify the new subscription, then restore the profile. Delete
+  the old Notion subscription because its verified URL cannot change.
 - **No webhook arrives:** confirm the subscription is active, the public HTTPS
   route is reachable, and the connection can access the changed page. Some
   Notion events are aggregated and delayed.
@@ -585,7 +661,11 @@ release tags, and version metadata are maintained by the release workflow.
 
 Licensed under the [MIT License](LICENSE).
 
-[cloudflare-tunnel]: https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/local-management/configuration-file/
+[cloudflare-install]: https://developers.cloudflare.com/tunnel/advanced/local-management/create-local-tunnel/#1-download-and-install-cloudflared
+[cloudflare-named-tunnel]: https://developers.cloudflare.com/tunnel/advanced/local-management/create-local-tunnel/
+[cloudflare-remote-tunnel]: https://developers.cloudflare.com/tunnel/advanced/remote-management/
+[cloudflare-tunnel-permissions]: https://developers.cloudflare.com/tunnel/features/locally-managed-tunnels/tunnel-permissions/
+[cloudflare-tunnel-tokens]: https://developers.cloudflare.com/tunnel/advanced/tunnel-tokens/
 [codex-exec]: https://developers.openai.com/codex/noninteractive
 [notion-automations]: https://www.notion.com/help/database-automations
 [notion-delivery]: https://developers.notion.com/reference/webhooks-events-delivery

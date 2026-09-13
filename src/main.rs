@@ -122,6 +122,11 @@ Before you begin:
      working directory. See README.md for the configuration template.
   4. Share both Notion data sources with that connection. Eligible tasks have
      Status = Pending; their page body is the instruction sent to Codex.
+  5. Optional: configure [cloudflared] only for an existing named Cloudflare
+     Tunnel. Credential-file mode lets this runner supervise private local
+     ingress; remote-token mode keeps ingress in Cloudflare and requires a
+     separate read-only API credential. Omit it for any manually supervised
+     tunnel. See README.md before enrolling or rotating a remote-token tunnel.
 
 Commands:
   run-once
@@ -132,10 +137,13 @@ Commands:
   webhook-enroll --hostname <HOST> [--rotate]
       Generate a secret callback URL, listen for one Notion verification POST
       on 127.0.0.1:8080, and store the callback ID and token privately. No host
-      configuration is required. HOST must be a plain DNS hostname; it is
-      validated locally without a network lookup. The command prints the exact
-      HTTPS URL, Notion setup links, required events, API version, verification
-      steps, and externally managed tunnel guidance before it waits.
+      configuration is required. An optional credential-file [cloudflared]
+      profile generates private ingress and supervises the connector during
+      enrollment. Remote-token enrollment and rotation use the manual flow
+      because the exact callback must be printed before its dashboard route can
+      be configured. HOST must be a plain DNS hostname; it is validated locally
+      without a network lookup. The command prints the exact HTTPS URL, Notion
+      setup links, required events, API version, and verification steps.
 
       Repeat enrollment is refused. Use --rotate to generate a replacement URL
       and atomically replace the callback ID and token after Notion verifies it.
@@ -147,9 +155,12 @@ Commands:
       authenticated webhooks and health checks. Tasks execute sequentially.
       Requires the host configuration and an enrolled webhook token. To receive
       Notion events, route a public HTTPS webhook subscription to the configured
-      secret loopback webhook path through an externally managed tunnel. Unlike
-      the one-time enrollment request, serve requires X-Notion-Signature
-      authentication over the unmodified body.
+      secret loopback webhook path. With optional [cloudflared], the runner
+      supervises an existing named tunnel; otherwise the operator supervises
+      the tunnel. Credential-file mode generates private local ingress.
+      Remote-token mode verifies operator-managed Cloudflare ingress and never
+      changes it. Unlike the one-time enrollment request, serve requires
+      X-Notion-Signature authentication over the unmodified body.
 
 Examples:
   agent-handover run-once
@@ -379,9 +390,12 @@ mod tests {
         assert!(help.contains("Before you begin:"));
         assert!(help.contains("webhook-enroll --hostname <HOST> [--rotate]"));
         assert!(help.contains("plain DNS hostname"));
-        assert!(help.contains("externally managed tunnel guidance"));
+        assert!(help.contains("credential-file [cloudflared]"));
+        assert!(help.contains("Remote-token enrollment and rotation use the manual flow"));
         assert!(help.contains("Delete and recreate the Notion subscription"));
-        assert!(help.contains("serve requires X-Notion-Signature"));
+        assert!(help.contains("X-Notion-Signature authentication"));
+        assert!(help.contains("Credential-file mode lets this runner supervise"));
+        assert!(help.contains("Remote-token mode verifies operator-managed"));
         assert_eq!(parse_command(&[]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["--help".to_owned()]), Ok(Invocation::Help));
         assert_eq!(parse_command(&["-h".to_owned()]), Ok(Invocation::Help));
