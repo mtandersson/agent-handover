@@ -317,7 +317,11 @@ connector `token`, its Cloudflare `account_id`, and a separate least-privilege
 read-only `api_token`. Before enrollment accepts the callback, the runner reads
 the remote configuration and requires exactly the generated callback route to
 the loopback listener followed by `http_status:404`. It never writes Cloudflare
-configuration. Token-tunnel process supervision is configured separately.
+configuration. After that verification, it supervises `cloudflared` for the
+single enrollment window using its supported `--token-file` interface (requires
+cloudflared 2025.4.0 or later). The token is copied to a private state file so
+it never appears in process arguments or the connector environment; no local
+ingress configuration is generated for token tunnels.
 
 Supported sandbox values are `read-only`, `workspace-write`, and
 `danger-full-access`; the runner passes the configured policy through without

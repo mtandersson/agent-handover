@@ -202,14 +202,49 @@ fn main() -> ExitCode {
                             return runtime.block_on(async {
                                 let listener = enrollment::bind_listener().await?;
                                 let api = cloudflare::CloudflareApi::new()?;
-                                cloudflare::verify_remote_ingress(
-                                    &api, &profile, &runner, callback_id,
-                                ).await?;
+                                let connector = cloudflare::verify_and_prepare_remote(
+                                    &api,
+                                    &profile,
+                                    &paths,
+                                    &runner,
+                                    callback_id,
+                                )
+                                .await?;
+                                let _signal_guard = EnrollmentSignalGuard::install()?;
+                                let supervisor = cloudflare::ConnectorSupervisor::start(
+                                    &profile,
+                                    &connector,
+                                    &ENROLLMENT_CANCELLED,
+                                )?;
                                 let stdout = io::stdout();
                                 let mut output = stdout.lock();
-                                enrollment::enroll_with_listener(
-                                    &hostname, callback_id, listener, &store, rotate, enrollment::TunnelGuidance::RemoteIngressVerified, &mut output,
-                                ).await
+                                let enrollment = enrollment::enroll_with_listener(
+                                    &hostname,
+                                    callback_id,
+                                    listener,
+                                    &store,
+                                    rotate,
+                                    enrollment::TunnelGuidance::ManagedConnectorReady,
+                                    &mut output,
+                                );
+                                tokio::pin!(enrollment);
+                                let connector_exit = async {
+                                    loop {
+                                        if ENROLLMENT_CANCELLED.load(Ordering::Relaxed) {
+                                            return Err("managed Cloudflare tunnel enrollment cancelled".to_owned());
+                                        }
+                                        if supervisor.exited()? {
+                                            return Err("managed Cloudflare tunnel exited during enrollment".to_owned());
+                                        }
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
+                                    }
+                                };
+                                tokio::pin!(connector_exit);
+                                tokio::select! {
+                                    result = &mut enrollment => result,
+                                    result = &mut connector_exit => result,
+                                    _ = tokio::time::sleep(Duration::from_secs(900)) => Err("managed tunnel enrollment timed out".to_owned()),
+                                }
                             });
                         } else {
                             return runtime.block_on(async {
@@ -234,7 +269,7 @@ fn main() -> ExitCode {
                                 listener,
                                 &store,
                                 rotate,
-                                enrollment::TunnelGuidance::LocalConnectorReady,
+                                enrollment::TunnelGuidance::ManagedConnectorReady,
                                 &mut output,
                             );
                             tokio::pin!(enrollment);
