@@ -1,3 +1,29 @@
+## [0.11.0](https://github.com/mtandersson/agent-handover/compare/v0.10.0...v0.11.0) (2026-09-13)
+
+### Features
+
+* **cli:** add actionable command help ([#66](https://github.com/mtandersson/agent-handover/issues/66)) ([6b04809](https://github.com/mtandersson/agent-handover/commit/6b048094095047a2454e7e25ac117a4763d34676))
+* **cloudflared:** prepare private tunnel ingress ([2962b4d](https://github.com/mtandersson/agent-handover/commit/2962b4d33ed2723ddb5acb907c6e4c853f56951f))
+* **cloudflared:** supervise credential tunnel enrollment ([d5d6045](https://github.com/mtandersson/agent-handover/commit/d5d6045c4fe72d59551ed3b92d4e620f6444bc09))
+* **cloudflared:** supervise remote token enrollment ([7036440](https://github.com/mtandersson/agent-handover/commit/7036440e538cd6a9643fce39fd73e2e5bae064df))
+* **cloudflared:** verify remote tunnel ingress ([00d284f](https://github.com/mtandersson/agent-handover/commit/00d284fb79c4137b662b83328e0632dff384ccb8))
+* **enrollment:** receive verification on secret path ([#73](https://github.com/mtandersson/agent-handover/issues/73)) ([de73341](https://github.com/mtandersson/agent-handover/commit/de733413fb7f08c95d0619335c6db1ad22a54e7d)), closes [#70](https://github.com/mtandersson/agent-handover/issues/70)
+* serve webhooks on enrolled secret path ([ca2daea](https://github.com/mtandersson/agent-handover/commit/ca2daeadb0b4300c004c720d6ca73633a275c82d))
+* **serving:** supervise managed Cloudflare tunnels ([f5e84b4](https://github.com/mtandersson/agent-handover/commit/f5e84b4d85961e68a470a590d7e77695573723ea))
+
+### Bug Fixes
+
+* **cli:** show command-specific help ([5bdd754](https://github.com/mtandersson/agent-handover/commit/5bdd754f0d43ad1369e5d485df085250abd515f8))
+
+### Documentation
+
+* **cloudflare:** guide managed tunnel operation ([c4436d5](https://github.com/mtandersson/agent-handover/commit/c4436d56ceb3ec75ed3f8c25bf269676315e8c04))
+* guide secret webhook enrollment ([#76](https://github.com/mtandersson/agent-handover/issues/76)) ([bf0b793](https://github.com/mtandersson/agent-handover/commit/bf0b793d8fd63b5bd8849c639e463e37ca89b2fa))
+
+### Chores
+
+* **deps:** update rust crate toml to v1.1.6 ([#74](https://github.com/mtandersson/agent-handover/issues/74)) ([59ff8df](https://github.com/mtandersson/agent-handover/commit/59ff8dfe2289701ed03d87dac72827b83f2f6726))
+
 ## [0.10.0](https://github.com/mtandersson/agent-handover/compare/v0.9.0...v0.10.0) (2026-09-09)
 
 ### Features
