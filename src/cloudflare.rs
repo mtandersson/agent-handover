@@ -271,6 +271,12 @@ impl ConnectorSupervisor {
     }
 }
 
+impl crate::serving::Connector for ConnectorSupervisor {
+    fn exited(&self) -> Result<bool, String> {
+        Self::exited(self)
+    }
+}
+
 impl Drop for ConnectorSupervisor {
     fn drop(&mut self) {
         // SIGKILL gives bounded cleanup on all enrollment exits. The direct

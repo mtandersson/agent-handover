@@ -1,4 +1,4 @@
-use crate::config::{Config, NotionConfig, TaskValues};
+use crate::config::{Config, HostPaths, NotionConfig, TaskValues};
 use crate::coordination::{PreparationSink, RevisionCoordinator};
 use crate::discovery::NotionEventDispatcher;
 use crate::enrollment::EnrollmentSource;
@@ -8,16 +8,21 @@ use crate::orchestration::ExecutionWorkflow;
 use crate::reconciliation::reconcile_once;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+/// The narrow lifecycle boundary used by serving. Implementations must own and
+/// reap their complete child process group when dropped.
+pub(crate) trait Connector: Send + Sync {
+    fn exited(&self) -> Result<bool, String>;
+}
+
 pub(crate) fn serve<T: EnrollmentSource>(
     config: &Config,
     token_source: &T,
-    state_directory: PathBuf,
+    paths: HostPaths,
     notion: NotionHttpClient,
     notion_config: &NotionConfig,
     task_values: &TaskValues,
@@ -32,7 +37,7 @@ pub(crate) fn serve<T: EnrollmentSource>(
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start HTTP runtime: {error}"))?;
-    let store = Arc::new(crate::state::AttemptStore::new(state_directory).acquire()?);
+    let store = Arc::new(crate::state::AttemptStore::new(paths.state_directory.clone()).acquire()?);
     let workflow = ExecutionWorkflow::new(
         store,
         notion.clone(),
@@ -48,9 +53,11 @@ pub(crate) fn serve<T: EnrollmentSource>(
         task_values,
     );
     runtime.block_on(async {
-        let listener = TcpListener::bind(address)
-            .await
-            .map_err(|error| format!("cannot bind HTTP server: {error}"))?;
+        let (connector, listener) = start_connector_before_intake(
+            start_connector(config, &paths, enrollment.callback_id()),
+            address,
+        )
+        .await?;
         let shutdown = shutdown_signal()?;
         let webhook_path = enrollment.webhook_path();
         run(
@@ -64,10 +71,63 @@ pub(crate) fn serve<T: EnrollmentSource>(
             notion_config,
             task_values,
             shutdown,
+            connector,
         )
         .await
     })?;
     Ok("HTTP server stopped".to_owned())
+}
+
+async fn start_connector_before_intake<C, F>(
+    start: F,
+    address: SocketAddr,
+) -> Result<(Option<C>, TcpListener), String>
+where
+    F: Future<Output = Result<Option<C>, String>>,
+{
+    let connector = start.await?;
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|error| format!("cannot bind HTTP server: {error}"))?;
+    Ok((connector, listener))
+}
+
+async fn start_connector(
+    config: &Config,
+    paths: &HostPaths,
+    callback_id: uuid::Uuid,
+) -> Result<Option<Box<dyn Connector>>, String> {
+    let Some(profile) = config.cloudflared.as_ref() else {
+        return Ok(None);
+    };
+    let prepared = if profile.uses_remote_configuration() {
+        let api = crate::cloudflare::CloudflareApi::new()
+            .map_err(|_| "cannot prepare managed Cloudflare tunnel".to_owned())?;
+        crate::cloudflare::verify_and_prepare_remote(
+            &api,
+            profile,
+            paths,
+            &config.runner,
+            callback_id,
+        )
+        .await
+        .map_err(|_| "cannot prepare managed Cloudflare tunnel".to_owned())?
+    } else {
+        crate::cloudflare::prepare(profile, paths, &config.runner, callback_id)
+            .map_err(|_| "cannot prepare managed Cloudflare tunnel".to_owned())?
+    };
+    let profile = profile.clone();
+    let supervisor = tokio::task::spawn_blocking(move || {
+        crate::cloudflare::ConnectorSupervisor::start(
+            &profile,
+            &prepared,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+    })
+    .await
+    .map_err(|_| "cannot start managed Cloudflare tunnel".to_owned())?
+    .map_err(|_| "cannot start managed Cloudflare tunnel".to_owned())?;
+    Ok(Some(Box::new(supervisor)))
 }
 
 fn shutdown_signal() -> Result<impl Future<Output = ()> + Send + 'static, String> {
@@ -95,6 +155,7 @@ async fn run<N, S, F>(
     notion_config: &NotionConfig,
     task_values: &TaskValues,
     shutdown: F,
+    connector: Option<Box<dyn Connector>>,
 ) -> Result<(), String>
 where
     N: NotionAdapter + Clone,
@@ -144,25 +205,51 @@ where
         interval,
         scheduler_stop,
     ));
-    let result = tokio::select! {
-        _ = &mut shutdown => {
-            let _ = stop.send(true);
-            let (http_result, ()) = tokio::join!(&mut http, &mut scheduler);
-            http_result
-        }
-        result = &mut http => {
-            let _ = stop.send(true);
-            scheduler.await;
-            result
-        }
-        () = &mut scheduler => {
-            let _ = stop.send(true);
-            let _ = http.await;
-            Err("reconciliation scheduler stopped unexpectedly".to_owned())
+    let result = {
+        let mut connector_exit = Box::pin(wait_for_connector_exit(connector.as_deref()));
+        tokio::select! {
+            _ = &mut shutdown => {
+                let _ = stop.send(true);
+                let (http_result, ()) = tokio::join!(&mut http, &mut scheduler);
+                http_result
+            }
+            result = &mut http => {
+                let _ = stop.send(true);
+                scheduler.await;
+                result
+            }
+            () = &mut scheduler => {
+                let _ = stop.send(true);
+                let _ = http.await;
+                Err("reconciliation scheduler stopped unexpectedly".to_owned())
+            }
+            result = &mut connector_exit => {
+                let _ = stop.send(true);
+                let _ = http.await;
+                scheduler.await;
+                result
+            }
         }
     };
     dispatcher_drain.wait_for_idle().await;
+    drop(connector);
     result
+}
+
+async fn wait_for_connector_exit(connector: Option<&dyn Connector>) -> Result<(), String> {
+    let Some(connector) = connector else {
+        std::future::pending::<()>().await;
+        unreachable!();
+    };
+    loop {
+        if connector
+            .exited()
+            .map_err(|_| "cannot supervise managed Cloudflare tunnel".to_owned())?
+        {
+            return Err("managed Cloudflare tunnel stopped unexpectedly".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn periodic_reconciliation<N, S>(
@@ -210,7 +297,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Semaphore, oneshot};
 
@@ -292,6 +379,24 @@ mod tests {
             page_id: &'a str,
         ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
             Box::pin(async move { Ok(format!("instructions-{page_id}")) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeConnector {
+        exited: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Connector for FakeConnector {
+        fn exited(&self) -> Result<bool, String> {
+            Ok(self.exited.load(Ordering::SeqCst))
+        }
+    }
+
+    impl Drop for FakeConnector {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
         }
     }
 
@@ -453,6 +558,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                None,
             )
             .await
         });
@@ -511,11 +617,84 @@ mod tests {
                 &notion_config,
                 &values,
                 std::future::pending::<()>(),
+                None,
             )
             .await
             .unwrap_err(),
             "serve startup reconciliation failed"
         );
+    }
+
+    #[tokio::test]
+    async fn connector_startup_failure_does_not_bind_healthy_http_intake() {
+        let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        assert_eq!(
+            start_connector_before_intake(
+                async {
+                    Err::<Option<FakeConnector>, _>(
+                        "cannot start managed Cloudflare tunnel".to_owned(),
+                    )
+                },
+                address,
+            )
+            .await
+            .unwrap_err(),
+            "cannot start managed Cloudflare tunnel"
+        );
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn unexpected_connector_exit_stops_intake_with_a_content_free_error() {
+        let notion = FakeNotion::new(vec![step(Ok(page(Vec::new())))], Vec::new());
+        let coordinator = Arc::new(RevisionCoordinator::new(RecordingPreparation::default()));
+        let (runner, notion_config, values) = configs(60);
+        let dispatcher = NotionEventDispatcher::with_coordinator(
+            notion.clone(),
+            Arc::clone(&coordinator),
+            &notion_config,
+            &values,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let connector = FakeConnector {
+            exited: Arc::clone(&exited),
+            dropped: Arc::clone(&dropped),
+        };
+        let served = tokio::spawn(async move {
+            run(
+                listener,
+                &runner,
+                WEBHOOK_PATH.to_owned(),
+                TOKEN.to_vec(),
+                notion,
+                coordinator,
+                dispatcher,
+                &notion_config,
+                &values,
+                std::future::pending::<()>(),
+                Some(Box::new(connector)),
+            )
+            .await
+        });
+        assert!(
+            exchange(
+                address,
+                b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .await
+            .starts_with("HTTP/1.1 200")
+        );
+        exited.store(true, Ordering::SeqCst);
+        assert_eq!(
+            served.await.unwrap().unwrap_err(),
+            "managed Cloudflare tunnel stopped unexpectedly"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -552,6 +731,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                None,
             )
             .await
         });
@@ -587,6 +767,11 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, stopped) = oneshot::channel();
+        let connector_dropped = Arc::new(AtomicBool::new(false));
+        let connector = FakeConnector {
+            exited: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::clone(&connector_dropped),
+        };
         let served = tokio::spawn(async move {
             run(
                 listener,
@@ -601,6 +786,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                Some(Box::new(connector)),
             )
             .await
         });
@@ -620,6 +806,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         shutdown.send(()).unwrap();
         assert!(served.await.unwrap().is_ok());
+        assert!(connector_dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test(start_paused = true)]
@@ -665,6 +852,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                None,
             )
             .await
         });
@@ -731,6 +919,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                None,
             )
             .await
         });
@@ -785,6 +974,7 @@ mod tests {
                 async {
                     let _ = stopped.await;
                 },
+                None,
             )
             .await
         });
