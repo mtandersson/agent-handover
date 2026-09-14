@@ -531,16 +531,19 @@ fn validate_run_id(run_id: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::executor::Outcome;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     fn temporary_directory() -> PathBuf {
-        let suffix = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "agent-handover-state-test-{}-{suffix}",
-            std::process::id()
-        ))
+        loop {
+            let directory = std::env::temp_dir().join(format!(
+                "agent-handover-state-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            match fs::create_dir(&directory) {
+                Ok(()) => return directory,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("cannot create test state directory: {error}"),
+            }
+        }
     }
 
     fn successful_result() -> ExecutorResult {
