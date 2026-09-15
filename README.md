@@ -508,9 +508,12 @@ before its HTTP accept loop is considered started. It then repeats the cycle eve
 webhook signals remain active. Scheduled and webhook discoveries share one
 revision coordinator and one sequential preparation boundary, so the same or
 an older revision is not prepared twice across sources. A failed periodic
-cycle emits a content-free diagnostic and the next configured cycle still
-runs. Clean shutdown stops HTTP intake and waits for an active reconciliation
-and preparation handoff to finish; it does not abandon that work midway.
+cycle emits a fixed, content-free failure category so operators can identify
+the failed reconciliation or recovery phase, and the next configured cycle
+still runs. A startup reconciliation failure reports the same safe category
+before `serve` exits.
+Clean shutdown stops HTTP intake and waits for an active reconciliation and
+preparation handoff to finish; it does not abandon that work midway.
 
 Each local attempt is durably published with mode `0600` before orchestration
 performs remote writes. The workflow updates and reads back `Running`, creates
