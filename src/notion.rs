@@ -40,7 +40,7 @@ pub struct PendingTaskPage {
     pub response_bytes: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct InitialJournalAttempt {
     pub run_id: String,
     pub task_page_id: String,
@@ -48,11 +48,45 @@ pub struct InitialJournalAttempt {
     pub started_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct FinalJournalAttempt {
     pub initial: InitialJournalAttempt,
     pub ended_at: String,
     pub result: ExecutorResult,
+}
+
+impl PartialEq for InitialJournalAttempt {
+    fn eq(&self, other: &Self) -> bool {
+        self.run_id == other.run_id
+            && self.task_page_id == other.task_page_id
+            && self.executor == other.executor
+            && notion_date_matches(&self.started_at, &other.started_at)
+    }
+}
+
+impl Eq for InitialJournalAttempt {}
+
+impl PartialEq for FinalJournalAttempt {
+    fn eq(&self, other: &Self) -> bool {
+        self.initial == other.initial
+            && notion_date_matches(&self.ended_at, &other.ended_at)
+            && self.result == other.result
+    }
+}
+
+impl Eq for FinalJournalAttempt {}
+
+fn notion_date_matches(left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    let Ok(left) = OffsetDateTime::parse(left, &Rfc3339) else {
+        return false;
+    };
+    let Ok(right) = OffsetDateTime::parse(right, &Rfc3339) else {
+        return false;
+    };
+    left.unix_timestamp().div_euclid(60) == right.unix_timestamp().div_euclid(60)
 }
 
 impl TaskRevision {
@@ -853,6 +887,66 @@ mod tests {
         JournalValues {
             executor: "Codex".to_owned(),
         }
+    }
+
+    fn initial_journal(started_at: &str) -> InitialJournalAttempt {
+        InitialJournalAttempt {
+            run_id: "run-placeholder".to_owned(),
+            task_page_id: "task-placeholder".to_owned(),
+            executor: "Codex".to_owned(),
+            started_at: started_at.to_owned(),
+        }
+    }
+
+    #[test]
+    fn journal_identity_accepts_notion_date_precision_within_the_same_minute() {
+        assert_eq!(
+            initial_journal("2026-09-14T19:09:56.356Z"),
+            initial_journal("2026-09-14T19:09:00.000+00:00")
+        );
+    }
+
+    #[test]
+    fn journal_identity_rejects_dates_from_different_minutes() {
+        assert_ne!(
+            initial_journal("2026-09-14T19:09:59Z"),
+            initial_journal("2026-09-14T19:10:00Z")
+        );
+    }
+
+    #[test]
+    fn journal_identity_keeps_exact_comparison_for_unparseable_dates() {
+        assert_eq!(initial_journal("invalid"), initial_journal("invalid"));
+        assert_ne!(initial_journal("invalid"), initial_journal("also-invalid"));
+    }
+
+    fn final_journal(ended_at: &str, summary: &str) -> FinalJournalAttempt {
+        FinalJournalAttempt {
+            initial: initial_journal("2026-09-14T19:09:00Z"),
+            ended_at: ended_at.to_owned(),
+            result: ExecutorResult {
+                outcome: Outcome::Done,
+                summary: summary.to_owned(),
+                actions: vec!["wrote result".to_owned()],
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn final_journal_identity_normalizes_only_the_date_precision() {
+        assert_eq!(
+            final_journal("2026-09-14T19:10:42.123Z", "completed"),
+            final_journal("2026-09-14T19:10:00+00:00", "completed")
+        );
+        assert_ne!(
+            final_journal("2026-09-14T19:10:59Z", "completed"),
+            final_journal("2026-09-14T19:11:00Z", "completed")
+        );
+        assert_ne!(
+            final_journal("2026-09-14T19:10:42Z", "completed"),
+            final_journal("2026-09-14T19:10:00Z", "changed")
+        );
     }
 
     fn config() -> NotionConfig {

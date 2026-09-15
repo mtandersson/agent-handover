@@ -171,12 +171,22 @@ where
         tokio::pin!(startup);
         tokio::select! {
             result = &mut startup => {
-                result.map_err(|_| "serve startup reconciliation failed".to_owned())?;
+                result.map_err(|error| {
+                    format!(
+                        "serve startup reconciliation failed: {}",
+                        reconciliation_failure_category(&error)
+                    )
+                })?;
             }
             _ = &mut shutdown => {
                 startup
                     .await
-                    .map_err(|_| "serve startup reconciliation failed".to_owned())?;
+                    .map_err(|error| {
+                        format!(
+                            "serve startup reconciliation failed: {}",
+                            reconciliation_failure_category(&error)
+                        )
+                    })?;
                 return Ok(());
             }
         }
@@ -274,14 +284,35 @@ async fn periodic_reconciliation<N, S>(
                 return;
             }
             _ = ticks.tick() => {
-                if reconcile_once(&notion, &coordinator, &notion_config, &task_values)
-                    .await
-                    .is_err()
-                {
-                    eprintln!("periodic reconciliation failed; will retry at the configured interval");
+                if let Err(error) = reconcile_once(
+                    &notion,
+                    &coordinator,
+                    &notion_config,
+                    &task_values,
+                ).await {
+                    eprintln!(
+                        "periodic reconciliation failed: {}; \
+                         will retry at the configured interval",
+                        reconciliation_failure_category(&error)
+                    );
                 }
             }
         }
+    }
+}
+
+fn reconciliation_failure_category(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if error.contains("journal") {
+        "Notion journal reconciliation failed"
+    } else if error.contains("pending task") || error.contains("query") {
+        "Notion Pending task query failed"
+    } else if error.contains("attempt") || error.contains("recover") {
+        "local attempt recovery failed"
+    } else if error.contains("executor") {
+        "executor workflow failed"
+    } else {
+        "reconciliation operation failed"
     }
 }
 
@@ -621,7 +652,21 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            "serve startup reconciliation failed"
+            "serve startup reconciliation failed: reconciliation operation failed"
+        );
+    }
+
+    #[test]
+    fn reconciliation_diagnostics_are_useful_without_repeating_error_content() {
+        assert_eq!(
+            reconciliation_failure_category(
+                "Notion journal readback does not match the durable attempt"
+            ),
+            "Notion journal reconciliation failed"
+        );
+        assert_eq!(
+            reconciliation_failure_category("private remote detail"),
+            "reconciliation operation failed"
         );
     }
 
