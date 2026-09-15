@@ -12,6 +12,7 @@ mod discovery;
 mod enrollment;
 mod executor;
 mod http;
+mod logging;
 mod notion;
 mod orchestration;
 mod reconciliation;
@@ -241,6 +242,7 @@ fn run_once_response(count: usize) -> String {
 }
 
 fn main() -> ExitCode {
+    logging::initialize();
     let args = env::args().skip(1).collect::<Vec<_>>();
 
     let result = match parse_command(&args) {

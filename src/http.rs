@@ -195,14 +195,18 @@ async fn endpoint<D: EventDispatcher>(
         return response(StatusCode::NOT_FOUND, "not found\n").into_response();
     }
     if method != Method::POST {
+        tracing::debug!("webhook request rejected: method not allowed");
         return response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n").into_response();
     }
-
     let (parts, body) = request.into_parts();
     let Some(signature) = single_signature(&parts.headers) else {
+        tracing::debug!("webhook request received");
+        tracing::debug!("webhook authentication rejected");
         return response(StatusCode::UNAUTHORIZED, "unauthorized\n").into_response();
     };
     if content_length_exceeds_limit(&parts.headers) {
+        tracing::debug!("webhook request received");
+        tracing::debug!("webhook payload rejected: too large");
         return response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n").into_response();
     }
     let body = match tokio::time::timeout(
@@ -212,6 +216,8 @@ async fn endpoint<D: EventDispatcher>(
     .await
     {
         Err(_) => {
+            tracing::debug!("webhook request received");
+            tracing::debug!("webhook payload rejected: body timeout");
             return response(StatusCode::REQUEST_TIMEOUT, "request timeout\n").into_response();
         }
         Ok(Err(error))
@@ -219,9 +225,15 @@ async fn endpoint<D: EventDispatcher>(
                 .source()
                 .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
         {
+            tracing::debug!("webhook request received");
+            tracing::debug!("webhook payload rejected: too large");
             return response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large\n").into_response();
         }
-        Ok(Err(_)) => return response(StatusCode::BAD_REQUEST, "bad request\n").into_response(),
+        Ok(Err(_)) => {
+            tracing::debug!("webhook request received");
+            tracing::debug!("webhook payload rejected: body read failed");
+            return response(StatusCode::BAD_REQUEST, "bad request\n").into_response();
+        }
         Ok(Ok(body)) => body,
     };
     handle(
@@ -271,19 +283,32 @@ async fn handle<D: EventDispatcher>(
         return response(StatusCode::NOT_FOUND, "not found\n");
     }
     if request.method != Method::POST {
+        tracing::debug!("webhook request rejected: method not allowed");
         return response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed\n");
     }
+    tracing::debug!("webhook request received");
     let signature = signature.or_else(|| single_signature(request.headers));
     if !valid_signature(signature, request.body, &state.token) {
+        tracing::debug!("webhook authentication rejected");
         return response(StatusCode::UNAUTHORIZED, "unauthorized\n");
     }
+    tracing::debug!("webhook authentication succeeded");
     let event = match serde_json::from_slice(request.body) {
         Ok(event) => event,
-        Err(_) => return response(StatusCode::BAD_REQUEST, "bad request\n"),
+        Err(_) => {
+            tracing::debug!("webhook payload rejected: invalid JSON");
+            return response(StatusCode::BAD_REQUEST, "bad request\n");
+        }
     };
     match state.dispatcher.dispatch(event).await {
-        Ok(()) => response(StatusCode::OK, "accepted\n"),
-        Err(_) => response(StatusCode::INTERNAL_SERVER_ERROR, "event dispatch failed\n"),
+        Ok(()) => {
+            tracing::debug!("webhook dispatch completed");
+            response(StatusCode::OK, "accepted\n")
+        }
+        Err(_) => {
+            tracing::warn!("webhook dispatch failed");
+            response(StatusCode::INTERNAL_SERVER_ERROR, "event dispatch failed\n")
+        }
     }
 }
 
@@ -338,12 +363,44 @@ impl IntoResponse for HttpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
     use std::os::fd::AsRawFd;
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    use tracing::instrument::WithSubscriber;
 
     const TOKEN: &[u8] = b"verification-secret-placeholder";
+
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogCapture {
+        fn output(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     #[derive(Default)]
     struct RecordingDispatcher {
@@ -466,6 +523,49 @@ mod tests {
             response(StatusCode::UNAUTHORIZED, "unauthorized\n")
         );
         assert_eq!(state.dispatcher.events.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_debug_logs_explain_handling_without_request_secrets() {
+        let state = test_state();
+        let headers = HeaderMap::new();
+        let body = br#"{"id":"private-page-id","prompt":"private-task-body"}"#;
+        let signed = signature(body);
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(capture.clone())
+            .finish();
+
+        let response = handle(
+            request(
+                &Method::POST,
+                "/custom/webhook/00000000-0000-4000-8000-000000000071",
+                &headers,
+                body,
+            ),
+            &state,
+            Some(&signed),
+        )
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(response, super::response(StatusCode::OK, "accepted\n"));
+        let output = capture.output();
+        assert!(output.contains("webhook request received"));
+        assert!(output.contains("webhook authentication succeeded"));
+        assert!(output.contains("webhook dispatch completed"));
+        for secret in [
+            "private-page-id",
+            "private-task-body",
+            std::str::from_utf8(TOKEN).unwrap(),
+            signed.as_str(),
+            "/custom/webhook/",
+        ] {
+            assert!(!output.contains(secret));
+        }
     }
 
     #[test]

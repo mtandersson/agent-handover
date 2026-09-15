@@ -89,6 +89,20 @@ tasks are made visibly `Running`, executed one at a time, have their validated
 result saved in private durable state, and are finalized in the shared journal
 before their task status becomes `Done` or `Error`.
 
+### Operational logging
+
+The service writes privacy-safe lifecycle logs to standard error. `info` logs
+show startup reconciliation and task preparation, executor, and finalization
+milestones. `debug` additionally shows periodic reconciliation and webhook
+receipt, authentication, filtering, and dispatch decisions. Enable them with
+`RUST_LOG=debug`; the default is `agent_handover=info`. Standard
+`tracing-subscriber` filter directives such as `agent_handover=debug` are also
+accepted.
+
+Operational logs intentionally omit task bodies, executor output, secrets,
+Notion identifiers, task/page/run identifiers, and personal paths. Failures
+use bounded categories instead of raw adapter error text.
+
 ## Notion setup
 
 The target runner works with Notion Free through the Public API and connection

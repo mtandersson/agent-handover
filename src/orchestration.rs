@@ -46,6 +46,17 @@ where
         task: DiscoveredTask,
         prepared: Option<PreparedAttempt>,
     ) -> Result<(), String> {
+        crate::logging::task_attempt_started();
+        let result = self.launch_inner(task, prepared).await;
+        crate::logging::task_attempt_finished(&result);
+        result
+    }
+
+    async fn launch_inner(
+        &self,
+        task: DiscoveredTask,
+        prepared: Option<PreparedAttempt>,
+    ) -> Result<(), String> {
         let started_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
@@ -60,18 +71,30 @@ where
             prepared,
         )
         .await?;
+        tracing::info!("task attempt prepared");
         self.store.record_launch_intent(ready.run_id())?;
         let run_id = ready.run_id().to_owned();
         let executor = Arc::clone(&self.executor);
+        tracing::info!("task executor started");
         let result = tokio::task::spawn_blocking(move || {
             executor.execute(ExecutorRequest {
                 instructions: task.instructions,
             })
         })
         .await
-        .map_err(|_| "executor task stopped unexpectedly".to_owned())?
-        .map_err(|_| "executor action failed; automatic retry is disabled".to_owned())?;
+        .map_err(|_| {
+            tracing::warn!(outcome = "stopped", "task executor finished");
+            "executor task stopped unexpectedly".to_owned()
+        })?
+        .map_err(|_| {
+            tracing::warn!(outcome = "failed", "task executor finished");
+            "executor action failed; automatic retry is disabled".to_owned()
+        })?;
         let outcome = result.outcome.clone();
+        match outcome {
+            Outcome::Done => tracing::info!(outcome = "done", "task executor finished"),
+            Outcome::Error => tracing::info!(outcome = "error", "task executor finished"),
+        }
         let completed_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
@@ -149,6 +172,26 @@ where
     }
 
     async fn recover_interrupted_launch(&self, attempt: PreparedAttempt) -> Result<(), String> {
+        tracing::warn!("interrupted task attempt recovery started");
+        let result = self.recover_interrupted_launch_inner(attempt).await;
+        if result.is_ok() {
+            tracing::info!(
+                outcome = "completed",
+                "interrupted task attempt recovery finished"
+            );
+        } else {
+            tracing::warn!(
+                outcome = "failed",
+                "interrupted task attempt recovery finished"
+            );
+        }
+        result
+    }
+
+    async fn recover_interrupted_launch_inner(
+        &self,
+        attempt: PreparedAttempt,
+    ) -> Result<(), String> {
         let completed_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
