@@ -149,15 +149,18 @@ where
 
     async fn process(&self, value: Value) -> EventResult {
         let Ok(event) = serde_json::from_value::<WebhookEvent>(value) else {
+            tracing::debug!("webhook signal ignored: unsupported payload");
             return Ok(());
         };
         if !event.is_task_signal(&self.inner.task_data_source_id) {
+            tracing::debug!("webhook signal ignored: unrelated event");
             return Ok(());
         }
 
         let existing = {
             let delivery = self.inner.delivery.lock().await;
             if delivery.handled_event_ids.contains(&event.id) {
+                tracing::debug!("webhook signal ignored: duplicate event");
                 return Ok(());
             }
             delivery
@@ -166,6 +169,7 @@ where
                 .map(watch::Sender::subscribe)
         };
         if let Some(mut completion) = existing {
+            tracing::debug!("webhook signal joined existing dispatch");
             return wait_for_completion(&mut completion).await;
         }
 
@@ -211,6 +215,7 @@ where
                 event,
                 permit,
             } => {
+                tracing::debug!("webhook signal dispatch started");
                 let inner = Arc::clone(&self.inner);
                 tokio::spawn(async move {
                     let _permit = permit;
@@ -264,9 +269,11 @@ where
             && task.status.as_deref() == Some(&self.pending)
             && !task.in_trash;
         if !eligible {
+            tracing::debug!("webhook signal ignored: task is not pending");
             return Ok(());
         }
 
+        tracing::debug!("webhook signal accepted for preparation");
         self.decide_and_discover(task).await
     }
 
@@ -282,6 +289,11 @@ where
     }
 
     async fn finish_event(&self, event_id: String, outcome: EventResult) {
+        if outcome.is_ok() {
+            tracing::debug!("webhook signal dispatch finished");
+        } else {
+            tracing::warn!("webhook signal dispatch failed");
+        }
         let mut delivery = self.delivery.lock().await;
         if outcome.is_ok() {
             delivery.remember_event(event_id.clone(), self.event_limit);

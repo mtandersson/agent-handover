@@ -165,8 +165,12 @@ where
     tokio::pin!(shutdown);
     {
         let startup = async {
-            coordinator.recover().await?;
-            reconcile_once(&notion, &coordinator, notion_config, task_values).await
+            tracing::info!("startup reconciliation started");
+            let recovered = coordinator.recover().await?;
+            let discovered =
+                reconcile_once(&notion, &coordinator, notion_config, task_values).await?;
+            tracing::info!(recovered, discovered, "startup reconciliation finished");
+            Ok::<_, String>(discovered)
         };
         tokio::pin!(startup);
         tokio::select! {
@@ -193,6 +197,7 @@ where
     }
 
     let interval = Duration::from_secs(runner.reconciliation_interval_seconds);
+    tracing::info!("HTTP webhook intake started");
     let dispatcher_drain = dispatcher.clone();
     let (stop, http_stop) = watch::channel(false);
     let scheduler_stop = stop.subscribe();
@@ -242,6 +247,7 @@ where
         }
     };
     dispatcher_drain.wait_for_idle().await;
+    tracing::info!("HTTP webhook intake stopped");
     drop(connector);
     result
 }
@@ -284,17 +290,22 @@ async fn periodic_reconciliation<N, S>(
                 return;
             }
             _ = ticks.tick() => {
-                if let Err(error) = reconcile_once(
+                tracing::debug!("periodic reconciliation started");
+                match reconcile_once(
                     &notion,
                     &coordinator,
                     &notion_config,
                     &task_values,
                 ).await {
-                    eprintln!(
-                        "periodic reconciliation failed: {}; \
-                         will retry at the configured interval",
-                        reconciliation_failure_category(&error)
-                    );
+                    Ok(discovered) => {
+                        tracing::debug!(discovered, "periodic reconciliation finished");
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            category = reconciliation_failure_category(&error),
+                            "periodic reconciliation failed; will retry at the configured interval"
+                        );
+                    }
                 }
             }
         }
