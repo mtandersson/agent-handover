@@ -1,3 +1,17 @@
+## [0.12.0](https://github.com/mtandersson/agent-handover/compare/v0.11.0...v0.12.0) (2026-09-21)
+
+### Features
+
+* add privacy-safe lifecycle logs ([5259234](https://github.com/mtandersson/agent-handover/commit/5259234f2a96f894f84c6a680bbfa9c0b65850f5))
+
+### Bug Fixes
+
+* handle Notion journal date precision ([31dadbf](https://github.com/mtandersson/agent-handover/commit/31dadbf1fc6ced4de74d75900bbed98700bc5e5f))
+
+### Tests
+
+* **state:** isolate temporary state directories ([8aec189](https://github.com/mtandersson/agent-handover/commit/8aec18991b1d68242d6aaafc016775fa370daf2d))
+
 ## [0.11.0](https://github.com/mtandersson/agent-handover/compare/v0.10.0...v0.11.0) (2026-09-13)
 
 ### Features
