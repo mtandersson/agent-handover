@@ -1457,6 +1457,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_retry_records_distinct_runs_and_verify_first_context() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls), notion: notion.clone(),
+                fail: true, outcome: Outcome::Done,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 0);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        let first = store.list_prepared().unwrap()[0].run_id().to_owned();
+        assert!(workflow.recover().await.is_err());
+        assert!(workflow.recover().await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].contains("# RECOVERY ATTEMPT (automatic)"));
+        assert!(calls[1].contains(&first));
+        assert!(calls[1].contains("BEFORE ANY WRITE"));
+        drop(calls);
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|a| a.result().unwrap().outcome == Outcome::Error));
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_obeys_backoff_and_excludes_agent_errors() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls), notion: notion.clone(),
+                fail: true, outcome: Outcome::Done,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 3600);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                notion, fail: false, outcome: Outcome::Error,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 0);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(store.list_prepared().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn error_to_pending_creates_one_distinct_attempt_for_the_new_revision() {
         let state_directory = directory();
         let store = Arc::new(
