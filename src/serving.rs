@@ -518,6 +518,8 @@ mod tests {
         (
             RunnerConfig {
                 reconciliation_interval_seconds: interval,
+                auto_retry_max_retries: 2,
+                auto_retry_delay_seconds: 900,
                 bind_address: "127.0.0.1:0".to_owned(),
                 webhook_path: "/notion/webhook".to_owned(),
                 health_path: "/health".to_owned(),
