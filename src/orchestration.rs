@@ -111,17 +111,15 @@ where
         if self.auto_retry_max_retries == 0 {
             return Ok(0);
         }
-        let mut groups: HashMap<(String, String), Vec<PreparedAttempt>> = HashMap::new();
+        let mut groups: HashMap<String, Vec<PreparedAttempt>> = HashMap::new();
         for attempt in self.store.list_prepared()? {
-            if let Some(revision) = attempt.task_revision() {
-                groups
-                    .entry((attempt.task_key().to_owned(), revision.to_owned()))
-                    .or_default()
-                    .push(attempt);
-            }
+            groups
+                .entry(attempt.task_key().to_owned())
+                .or_default()
+                .push(attempt);
         }
         let mut resumed = 0;
-        for ((page_id, revision), mut attempts) in groups {
+        for (page_id, mut attempts) in groups {
             // A prepared or launched attempt must be recovered, not duplicated.
             if attempts.iter().any(|attempt| attempt.result().is_none()) {
                 continue;
@@ -134,7 +132,17 @@ where
             let Some(last) = attempts.last() else {
                 continue;
             };
-            if attempts.len() > usize::from(self.auto_retry_max_retries)
+            // Consider only the newest attempt for each task, including
+            // manual retries with a newer Notion revision. An old failed
+            // revision must never become eligible again after newer work.
+            let Some(revision) = last.task_revision() else {
+                continue;
+            };
+            let current_revision_attempts = attempts
+                .iter()
+                .filter(|attempt| attempt.task_revision() == Some(revision))
+                .count();
+            if current_revision_attempts > usize::from(self.auto_retry_max_retries)
                 || !Self::is_automatic_retry_candidate(last)
             {
                 continue;
@@ -146,7 +154,7 @@ where
             )
             .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
             let backoff = self.auto_retry_delay_seconds.saturating_mul(
-                1_u64 << (attempts.len().saturating_sub(1).min(10)),
+                1_u64 << (current_revision_attempts.saturating_sub(1).min(10)),
             );
             if (OffsetDateTime::now_utc() - completed_at)
                 < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
@@ -163,7 +171,7 @@ where
             self.launch(
                 DiscoveredTask {
                     state: crate::notion::TaskState {
-                        revision: crate::notion::TaskRevision::parse(&revision)?,
+                        revision: crate::notion::TaskRevision::parse(revision)?,
                         ..observed
                     },
                     instructions,
