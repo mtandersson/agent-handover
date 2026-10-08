@@ -295,14 +295,22 @@ async fn periodic_reconciliation<N, S>(
             }
             _ = ticks.tick() => {
                 tracing::debug!("periodic reconciliation started");
-                match reconcile_once(
-                    &notion,
-                    &coordinator,
-                    &notion_config,
-                    &task_values,
-                ).await {
-                    Ok(discovered) => {
-                        tracing::debug!(discovered, "periodic reconciliation finished");
+                // Recover unfinished local launch intents and durable terminal
+                // writes on every tick, not only after a process restart.
+                // This also schedules bounded, delayed recovery attempts.
+                let cycle = async {
+                    let recovered = coordinator.recover().await?;
+                    let discovered = reconcile_once(
+                        &notion,
+                        &coordinator,
+                        &notion_config,
+                        &task_values,
+                    ).await?;
+                    Ok::<_, String>((recovered, discovered))
+                };
+                match cycle.await {
+                    Ok((recovered, discovered)) => {
+                        tracing::debug!(recovered, discovered, "periodic reconciliation finished");
                     }
                     Err(error) => {
                         tracing::warn!(
