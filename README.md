@@ -24,13 +24,12 @@ sequence.
   and the host's existing MCP servers and CLI tools.
 - Record every attempt in a shared Notion journal and project task progress as
   `Pending -> Running -> Done | Error`.
-- Recover interrupted bookkeeping without automatically launching Codex again.
+- Recover interrupted bookkeeping without relaunching the same run ID; optionally start bounded, verified recovery attempts under a new run ID.
 
 The private host profile selects Codex as the only executor for the first
 release; task authors do not choose an executor in Notion. The internal
 executor boundary and shared journal remain provider-neutral, but a Claude
-adapter, multiple host profiles, concurrent execution, and automatic agent
-retries are out of scope.
+adapter, multiple host profiles, concurrent execution, and unrestricted agent retries are out of scope.
 
 Private local state provides the process lock and durable launch authority.
 `run-once` performs one reconciliation;
@@ -487,6 +486,45 @@ the enrolled callback UUID and token:
 ```sh
 agent-handover webhook-enroll --hostname handover.example.com --rotate
 ```
+
+### Automatic recovery of interrupted and failed attempts
+
+The runner durably journals **every** executor outcome, including Codex process
+failure, invalid/missing result, and timeout. These failures become task
+`Error` rather than leaving an incomplete `Running` row. `serve` now
+replays incomplete local attempts and terminal Notion writes at each
+reconciliation interval, not only after a restart.
+
+An **executor failure** or an **interrupted launch of unknown outcome** may be
+retried after a configurable delay, as a **new run ID** and Notion journal
+entry. The attempt receives an explicit `RECOVERY ATTEMPT` preamble with the
+previous run ID and mandatory read-before-write instructions. Codex must first
+verify downstream Notion/Drive state, avoid duplicate effects, and return Error
+for operator review if it cannot determine whether the prior attempt succeeded.
+A structured Error *returned by Codex itself* is not automatically retried,
+because it may indicate missing permission, required human interaction, or a
+non-idempotent operation.
+
+```toml
+[runner]
+# Also supply the normal reconciliation, bind, webhook and health fields.
+auto_retry_max_retries = 2
+auto_retry_delay_seconds = 900
+```
+
+Both values have these defaults when omitted. The delay is 15 minutes after
+the first failure and increases exponentially for subsequent recoveries. Set
+`auto_retry_max_retries = 0` to disable automated reattempts. Retry counts
+are recovered from durable records across restarts. Individual run IDs still
+launch at most once. Local record and journal history must be retained.
+
+**Limitations:** tasks left in `Running` without matching private local durable
+attempt state cannot be safely auto-resumed: the runner cannot establish
+whether another executor already performed the external action. Inspect the
+host's attempts directory, original journal and target before an operator
+decides to retry them. Do not blindly flip stale tasks back to `Pending` or
+delete staging files. A new attempt has no exactly-once guarantee for external
+side effects, even with verification instructions.
 
 ## Task lifecycle and safety
 

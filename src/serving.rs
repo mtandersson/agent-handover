@@ -44,6 +44,10 @@ pub(crate) fn serve<T: EnrollmentSource>(
         crate::executor::CodexExecutor::new(config.codex.clone()),
         config.task_values.clone(),
         config.journal_values.executor.clone(),
+    )
+    .with_retry_policy(
+        config.runner.auto_retry_max_retries,
+        config.runner.auto_retry_delay_seconds,
     );
     let coordinator = Arc::new(RevisionCoordinator::new(workflow));
     let dispatcher = NotionEventDispatcher::with_coordinator(
@@ -291,14 +295,33 @@ async fn periodic_reconciliation<N, S>(
             }
             _ = ticks.tick() => {
                 tracing::debug!("periodic reconciliation started");
-                match reconcile_once(
-                    &notion,
-                    &coordinator,
-                    &notion_config,
-                    &task_values,
-                ).await {
-                    Ok(discovered) => {
-                        tracing::debug!(discovered, "periodic reconciliation finished");
+                // Recover unfinished local launch intents and durable terminal
+                // writes on every tick, not only after a process restart.
+                // This also schedules bounded, delayed recovery attempts.
+                let cycle = async {
+                    let recovered = match coordinator.recover().await {
+                        Ok(count) => count,
+                        Err(error) => {
+                            // A poisoned old attempt must not starve unrelated
+                            // Pending tasks. Keep the recovery error visible.
+                            tracing::warn!(
+                                category = reconciliation_failure_category(&error),
+                                "attempt recovery failed; continuing pending task discovery"
+                            );
+                            0
+                        }
+                    };
+                    let discovered = reconcile_once(
+                        &notion,
+                        &coordinator,
+                        &notion_config,
+                        &task_values,
+                    ).await?;
+                    Ok::<_, String>((recovered, discovered))
+                };
+                match cycle.await {
+                    Ok((recovered, discovered)) => {
+                        tracing::debug!(recovered, discovered, "periodic reconciliation finished");
                     }
                     Err(error) => {
                         tracing::warn!(
@@ -514,6 +537,8 @@ mod tests {
         (
             RunnerConfig {
                 reconciliation_interval_seconds: interval,
+                auto_retry_max_retries: 2,
+                auto_retry_delay_seconds: 900,
                 bind_address: "127.0.0.1:0".to_owned(),
                 webhook_path: "/notion/webhook".to_owned(),
                 health_path: "/health".to_owned(),

@@ -352,9 +352,21 @@ impl fmt::Display for SandboxPolicy {
 #[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     pub reconciliation_interval_seconds: u64,
+    #[serde(default = "default_auto_retry_max_retries")]
+    pub auto_retry_max_retries: u8,
+    #[serde(default = "default_auto_retry_delay_seconds")]
+    pub auto_retry_delay_seconds: u64,
     pub bind_address: String,
     pub webhook_path: String,
     pub health_path: String,
+}
+
+fn default_auto_retry_max_retries() -> u8 {
+    2
+}
+
+fn default_auto_retry_delay_seconds() -> u64 {
+    900
 }
 
 /// The optional, locally managed Cloudflare Tunnel profile. Credentials must
@@ -736,6 +748,13 @@ fn validate(config: &Config) -> Result<(), String> {
         );
     }
 
+    if config.runner.auto_retry_max_retries > 10 {
+        return Err("runner.auto_retry_max_retries cannot exceed 10".to_owned());
+    }
+    if config.runner.auto_retry_delay_seconds == 0 {
+        return Err("runner.auto_retry_delay_seconds must be greater than zero".to_owned());
+    }
+
     let mut environment = HashSet::new();
     for (index, name) in config.codex.permitted_environment.iter().enumerate() {
         let valid = !name.is_empty()
@@ -938,6 +957,30 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#
+    }
+
+    #[test]
+    fn automatic_recovery_defaults_are_bounded_and_backwards_compatible() {
+        let runner: RunnerConfig = toml::from_str(
+            r#"reconciliation_interval_seconds = 60
+bind_address = "127.0.0.1:8080"
+webhook_path = "/notion/webhook"
+health_path = "/health"
+"#,
+        ).unwrap();
+        assert_eq!(runner.auto_retry_max_retries, 2);
+        assert_eq!(runner.auto_retry_delay_seconds, 900);
+        let opt_out: RunnerConfig = toml::from_str(
+            r#"reconciliation_interval_seconds = 60
+auto_retry_max_retries = 0
+auto_retry_delay_seconds = 60
+bind_address = "127.0.0.1:8080"
+webhook_path = "/notion/webhook"
+health_path = "/health"
+"#,
+        ).unwrap();
+        assert_eq!(opt_out.auto_retry_max_retries, 0);
+        assert_eq!(opt_out.auto_retry_delay_seconds, 60);
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::discovery::DiscoveredTask;
 use crate::executor::{Executor, ExecutorRequest, ExecutorResult, Outcome};
 use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ pub(crate) struct ExecutionWorkflow<N, E> {
     executor: Arc<E>,
     task_values: TaskValues,
     executor_name: String,
+    auto_retry_max_retries: u8,
+    auto_retry_delay_seconds: u64,
 }
 
 impl<N, E> ExecutionWorkflow<N, E> {
@@ -32,7 +35,15 @@ impl<N, E> ExecutionWorkflow<N, E> {
             executor: Arc::new(executor),
             task_values,
             executor_name,
+            auto_retry_max_retries: 2,
+            auto_retry_delay_seconds: 900,
         }
+    }
+
+    pub(crate) fn with_retry_policy(mut self, max_retries: u8, delay_seconds: u64) -> Self {
+        self.auto_retry_max_retries = max_retries;
+        self.auto_retry_delay_seconds = delay_seconds;
+        self
     }
 }
 
@@ -41,6 +52,140 @@ where
     N: NotionAdapter,
     E: Executor + 'static,
 {
+    // Previous attempts are durable and include an immutable run ID. Give
+    // recovered Codex invocations the original brief plus explicit context,
+    // including the crucial verify-before-write rule. Do not persist or log
+    // task instruction text in local state.
+    fn instructions_for_attempt(&self, task: &DiscoveredTask) -> Result<String, String> {
+        let previous = self
+            .store
+            .list_prepared()?
+            .into_iter()
+            .filter(|attempt| {
+                attempt.task_key() == task.state.page_id
+                    && attempt.task_revision() == Some(task.state.revision.as_str())
+                    && attempt.result().is_some()
+            })
+            .max_by(|left, right| {
+                left.completed_at()
+                    .cmp(&right.completed_at())
+                    .then_with(|| left.run_id().cmp(right.run_id()))
+            });
+        let Some(previous) = previous else {
+            return Ok(task.instructions.clone());
+        };
+        Ok(format!(
+            "# RECOVERY ATTEMPT (automatic)\n\n\
+             The previous Agent Handover run ID was: {}. Its outcome is \
+             uncertain or failed. This is a new, separately journaled \
+             attempt, not a continuation of that process.\n\n\
+             BEFORE ANY WRITE, FILE DELETE, UPLOAD OR EXTERNAL ACTION:\n\
+             1. Read the exact target state, prior work and relevant run \
+             results. Determine whether the original success criteria are \
+             already satisfied.\n\
+             2. If complete, verify and report success without repeating \
+             effects. Finish only outstanding cleanup that is independently safe.\n\
+             3. If partially complete, perform only verified missing \
+             idempotent steps. Avoid duplicate Notion blocks, messages or \
+             other effects.\n\
+             4. If prior effects cannot be determined, or repetition may be \
+             non-idempotent, STOP and return structured Error requesting \
+             human review; do not guess. Preserve source/staging files.\n\
+             Follow all original scope, authorization and validation rules.\n\n\
+             # ORIGINAL TASK\n\n{}",
+            previous.run_id(),
+            task.instructions
+        ))
+    }
+
+    fn is_automatic_retry_candidate(attempt: &PreparedAttempt) -> bool {
+        let Some(result) = attempt.result() else {
+            return false;
+        };
+        result.outcome == Outcome::Error
+            && (result.summary == "executor failed before returning a valid result"
+                || result.summary == "runner restarted after launch intent; outcome is unknown")
+    }
+
+    async fn resume_eligible_failures(&self) -> Result<usize, String> {
+        if self.auto_retry_max_retries == 0 {
+            return Ok(0);
+        }
+        let mut groups: HashMap<String, Vec<PreparedAttempt>> = HashMap::new();
+        for attempt in self.store.list_prepared()? {
+            groups
+                .entry(attempt.task_key().to_owned())
+                .or_default()
+                .push(attempt);
+        }
+        let mut resumed = 0;
+        for (page_id, mut attempts) in groups {
+            // A prepared or launched attempt must be recovered, not duplicated.
+            if attempts.iter().any(|attempt| attempt.result().is_none()) {
+                continue;
+            }
+            attempts.sort_by(|left, right| {
+                left.completed_at()
+                    .cmp(&right.completed_at())
+                    .then_with(|| left.run_id().cmp(right.run_id()))
+            });
+            let Some(last) = attempts.last() else {
+                continue;
+            };
+            // Consider only the newest attempt for each task, including
+            // manual retries with a newer Notion revision. An old failed
+            // revision must never become eligible again after newer work.
+            let Some(revision) = last.task_revision() else {
+                continue;
+            };
+            let current_revision_attempts = attempts
+                .iter()
+                .filter(|attempt| attempt.task_revision() == Some(revision))
+                .count();
+            if current_revision_attempts > usize::from(self.auto_retry_max_retries)
+                || !Self::is_automatic_retry_candidate(last)
+            {
+                continue;
+            }
+            let completed_at = OffsetDateTime::parse(
+                last.completed_at()
+                    .ok_or_else(|| "retry candidate lacks completion time".to_owned())?,
+                &Rfc3339,
+            )
+            .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
+            let backoff = self.auto_retry_delay_seconds.saturating_mul(
+                1_u64 << (current_revision_attempts.saturating_sub(1).min(10)),
+            );
+            if (OffsetDateTime::now_utc() - completed_at)
+                < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
+            {
+                continue;
+            }
+            let observed = self.notion.refetch_task(&page_id).await?;
+            // An operator may have already retried, edited, or finished it.
+            // Only the runner-projected Error is eligible for resumption.
+            if observed.in_trash
+                || observed.status.as_deref() != Some(self.task_values.error.as_str())
+            {
+                continue;
+            }
+            let instructions = self.notion.render_task(&page_id).await?;
+            self.launch(
+                DiscoveredTask {
+                    state: crate::notion::TaskState {
+                        revision: crate::notion::TaskRevision::parse(revision)?,
+                        ..observed
+                    },
+                    instructions,
+                },
+                None,
+            )
+            .await?;
+            resumed += 1;
+        }
+        Ok(resumed)
+    }
+
     async fn launch(
         &self,
         task: DiscoveredTask,
@@ -74,22 +219,59 @@ where
         tracing::info!("task attempt prepared");
         self.store.record_launch_intent(ready.run_id())?;
         let run_id = ready.run_id().to_owned();
+        let instructions = self.instructions_for_attempt(&task)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
-        let result = tokio::task::spawn_blocking(move || {
+        let execution = tokio::task::spawn_blocking(move || {
             executor.execute(ExecutorRequest {
-                instructions: task.instructions,
+                instructions,
             })
         })
-        .await
-        .map_err(|_| {
-            tracing::warn!(outcome = "stopped", "task executor finished");
-            "executor task stopped unexpectedly".to_owned()
-        })?
-        .map_err(|_| {
-            tracing::warn!(outcome = "failed", "task executor finished");
-            "executor action failed; automatic retry is disabled".to_owned()
-        })?;
+        .await;
+        // Once launch_intent is durable every executor failure must cross the
+        // same durable-result boundary as a normal agent Error. Otherwise the
+        // task stays Running until a runner restart, with an unfinished journal.
+        // Never record arbitrary executor error text, which may contain secrets.
+        let (result, executor_failed) = match execution {
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(reason)) => {
+                let category = match reason.as_str() {
+                    "Codex executor timed out" => "timeout",
+                    "Codex executor exited unsuccessfully" => "nonzero_exit",
+                    "Codex executor could not be started" => "launch_failed",
+                    "Codex executor did not produce a result" => "no_result",
+                    "Codex executor returned an invalid result" => "invalid_result",
+                    _ => "other_executor_failure",
+                };
+                tracing::warn!(category, "task executor finished without a valid result");
+                (
+                    ExecutorResult {
+                        outcome: Outcome::Error,
+                        summary: "executor failed before returning a valid result".to_owned(),
+                        actions: Vec::new(),
+                        warnings: vec![format!(
+                            "executor failure ({category}); partial external effects may have occurred"
+                        )],
+                    },
+                    true,
+                )
+            }
+            Err(_) => {
+                tracing::warn!(category = "join_failure", "task executor join failed");
+                (
+                    ExecutorResult {
+                        outcome: Outcome::Error,
+                        summary: "executor failed before returning a valid result".to_owned(),
+                        actions: Vec::new(),
+                        warnings: vec![
+                            "executor failure (join_failure); partial external effects may have occurred"
+                                .to_owned(),
+                        ],
+                    },
+                    true,
+                )
+            }
+        };
         let outcome = result.outcome.clone();
         match outcome {
             Outcome::Done => tracing::info!(outcome = "done", "task executor finished"),
@@ -100,9 +282,12 @@ where
             .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
         self.store.store_result(&run_id, &completed_at, result)?;
         self.finalize(self.store.load(&run_id)?).await?;
-        match outcome {
-            crate::executor::Outcome::Done => Ok(()),
-            crate::executor::Outcome::Error => Err(
+        match (outcome, executor_failed) {
+            (Outcome::Done, _) => Ok(()),
+            (Outcome::Error, true) => {
+                Err("executor action failed; terminal Error recorded".to_owned())
+            }
+            (Outcome::Error, false) => Err(
                 "executor reported incomplete or blocked work; automatic retry is disabled"
                     .to_owned(),
             ),
@@ -270,6 +455,7 @@ where
                 self.launch(task, Some(attempt)).await?;
                 recovered += 1;
             }
+            recovered += self.resume_eligible_failures().await?;
             Ok(recovered)
         })
     }
@@ -1273,7 +1459,7 @@ mod tests {
             notion.clone(),
             FakeExecutor {
                 calls: Arc::clone(&calls),
-                notion,
+                notion: notion.clone(),
                 fail: true,
                 outcome: Outcome::Done,
             },
@@ -1286,14 +1472,91 @@ mod tests {
                 .prepare(discovered("private instructions"))
                 .await
                 .unwrap_err(),
-            "executor action failed; automatic retry is disabled"
+            "executor action failed; terminal Error recorded"
         );
         workflow
             .prepare(discovered("private instructions"))
             .await
             .unwrap();
 
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        assert_eq!(store.list_prepared().unwrap()[0].result().unwrap().outcome, Outcome::Error);
+        assert!(store.result_stored().unwrap().is_empty());
         assert_eq!(calls.lock().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_records_distinct_runs_and_verify_first_context() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls), notion: notion.clone(),
+                fail: true, outcome: Outcome::Done,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 0);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        let first = store.list_prepared().unwrap()[0].run_id().to_owned();
+        assert!(workflow.recover().await.is_err());
+        assert!(workflow.recover().await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].contains("# RECOVERY ATTEMPT (automatic)"));
+        assert!(calls[1].contains(&first));
+        assert!(calls[1].contains("BEFORE ANY WRITE"));
+        drop(calls);
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert!(attempts.iter().all(|a| a.result().unwrap().outcome == Outcome::Error));
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_obeys_backoff_and_excludes_agent_errors() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls), notion: notion.clone(),
+                fail: true, outcome: Outcome::Done,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 3600);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store), notion.clone(),
+            FakeExecutor {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                notion, fail: false, outcome: Outcome::Error,
+            },
+            values(), "Codex".to_owned(),
+        ).with_retry_policy(2, 0);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(store.list_prepared().unwrap().len(), 1);
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
