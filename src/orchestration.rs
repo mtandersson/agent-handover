@@ -1427,7 +1427,7 @@ mod tests {
             notion.clone(),
             FakeExecutor {
                 calls: Arc::clone(&calls),
-                notion,
+                notion: notion.clone(),
                 fail: true,
                 outcome: Outcome::Done,
             },
