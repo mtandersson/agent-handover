@@ -960,6 +960,30 @@ health_path = "/health"
     }
 
     #[test]
+    fn automatic_recovery_defaults_are_bounded_and_backwards_compatible() {
+        let runner: RunnerConfig = toml::from_str(
+            r#"reconciliation_interval_seconds = 60
+bind_address = "127.0.0.1:8080"
+webhook_path = "/notion/webhook"
+health_path = "/health"
+"#,
+        ).unwrap();
+        assert_eq!(runner.auto_retry_max_retries, 2);
+        assert_eq!(runner.auto_retry_delay_seconds, 900);
+        let opt_out: RunnerConfig = toml::from_str(
+            r#"reconciliation_interval_seconds = 60
+auto_retry_max_retries = 0
+auto_retry_delay_seconds = 60
+bind_address = "127.0.0.1:8080"
+webhook_path = "/notion/webhook"
+health_path = "/health"
+"#,
+        ).unwrap();
+        assert_eq!(opt_out.auto_retry_max_retries, 0);
+        assert_eq!(opt_out.auto_retry_delay_seconds, 60);
+    }
+
+    #[test]
     fn validates_an_optional_credential_file_cloudflared_profile() {
         let root = temporary_directory();
         let credentials = root.join("credentials.json");
