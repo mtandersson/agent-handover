@@ -76,20 +76,34 @@ where
         let run_id = ready.run_id().to_owned();
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
-        let result = tokio::task::spawn_blocking(move || {
+        let execution = tokio::task::spawn_blocking(move || {
             executor.execute(ExecutorRequest {
                 instructions: task.instructions,
             })
         })
-        .await
-        .map_err(|_| {
-            tracing::warn!(outcome = "stopped", "task executor finished");
-            "executor task stopped unexpectedly".to_owned()
-        })?
-        .map_err(|_| {
-            tracing::warn!(outcome = "failed", "task executor finished");
-            "executor action failed; automatic retry is disabled".to_owned()
-        })?;
+        .await;
+        // Once launch_intent is durable every executor failure must cross the
+        // same durable-result boundary as a normal agent Error. Otherwise the
+        // task stays Running until a runner restart, with an unfinished journal.
+        // Never record arbitrary executor error text, which may contain secrets.
+        let (result, executor_failed) = match execution {
+            Ok(Ok(result)) => (result, false),
+            Ok(Err(_)) | Err(_) => {
+                tracing::warn!(outcome = "failed", "task executor finished");
+                (
+                    ExecutorResult {
+                        outcome: Outcome::Error,
+                        summary: "executor failed before returning a valid result".to_owned(),
+                        actions: Vec::new(),
+                        warnings: vec![
+                            "executor failure; partial external effects may have occurred"
+                                .to_owned(),
+                        ],
+                    },
+                    true,
+                )
+            }
+        };
         let outcome = result.outcome.clone();
         match outcome {
             Outcome::Done => tracing::info!(outcome = "done", "task executor finished"),
@@ -100,9 +114,12 @@ where
             .map_err(|_| "cannot prepare attempt timestamp".to_owned())?;
         self.store.store_result(&run_id, &completed_at, result)?;
         self.finalize(self.store.load(&run_id)?).await?;
-        match outcome {
-            crate::executor::Outcome::Done => Ok(()),
-            crate::executor::Outcome::Error => Err(
+        match (outcome, executor_failed) {
+            (Outcome::Done, _) => Ok(()),
+            (Outcome::Error, true) => {
+                Err("executor action failed; terminal Error recorded".to_owned())
+            }
+            (Outcome::Error, false) => Err(
                 "executor reported incomplete or blocked work; automatic retry is disabled"
                     .to_owned(),
             ),
@@ -1286,7 +1303,7 @@ mod tests {
                 .prepare(discovered("private instructions"))
                 .await
                 .unwrap_err(),
-            "executor action failed; automatic retry is disabled"
+            "executor action failed; terminal Error recorded"
         );
         workflow
             .prepare(discovered("private instructions"))
