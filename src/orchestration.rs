@@ -164,7 +164,9 @@ where
             let observed = self.notion.refetch_task(&page_id).await?;
             // An operator may have already retried, edited, or finished it.
             // Only the runner-projected Error is eligible for resumption.
-            if observed.in_trash || observed.status.as_deref() != Some(self.task_values.error.as_str()) {
+            if observed.in_trash
+                || observed.status.as_deref() != Some(self.task_values.error.as_str())
+            {
                 continue;
             }
             let instructions = self.notion.render_task(&page_id).await?;
@@ -232,15 +234,37 @@ where
         // Never record arbitrary executor error text, which may contain secrets.
         let (result, executor_failed) = match execution {
             Ok(Ok(result)) => (result, false),
-            Ok(Err(_)) | Err(_) => {
-                tracing::warn!(outcome = "failed", "task executor finished");
+            Ok(Err(reason)) => {
+                let category = match reason.as_str() {
+                    "Codex executor timed out" => "timeout",
+                    "Codex executor exited unsuccessfully" => "nonzero_exit",
+                    "Codex executor could not be started" => "launch_failed",
+                    "Codex executor did not produce a result" => "no_result",
+                    "Codex executor returned an invalid result" => "invalid_result",
+                    _ => "other_executor_failure",
+                };
+                tracing::warn!(category, "task executor finished without a valid result");
+                (
+                    ExecutorResult {
+                        outcome: Outcome::Error,
+                        summary: "executor failed before returning a valid result".to_owned(),
+                        actions: Vec::new(),
+                        warnings: vec![format!(
+                            "executor failure ({category}); partial external effects may have occurred"
+                        )],
+                    },
+                    true,
+                )
+            }
+            Err(_) => {
+                tracing::warn!(category = "join_failure", "task executor join failed");
                 (
                     ExecutorResult {
                         outcome: Outcome::Error,
                         summary: "executor failed before returning a valid result".to_owned(),
                         actions: Vec::new(),
                         warnings: vec![
-                            "executor failure; partial external effects may have occurred"
+                            "executor failure (join_failure); partial external effects may have occurred"
                                 .to_owned(),
                         ],
                     },
