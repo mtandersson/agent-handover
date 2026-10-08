@@ -299,7 +299,18 @@ async fn periodic_reconciliation<N, S>(
                 // writes on every tick, not only after a process restart.
                 // This also schedules bounded, delayed recovery attempts.
                 let cycle = async {
-                    let recovered = coordinator.recover().await?;
+                    let recovered = match coordinator.recover().await {
+                        Ok(count) => count,
+                        Err(error) => {
+                            // A poisoned old attempt must not starve unrelated
+                            // Pending tasks. Keep the recovery error visible.
+                            tracing::warn!(
+                                category = reconciliation_failure_category(&error),
+                                "attempt recovery failed; continuing pending task discovery"
+                            );
+                            0
+                        }
+                    };
                     let discovered = reconcile_once(
                         &notion,
                         &coordinator,
