@@ -413,6 +413,10 @@ fn main() -> ExitCode {
                         executor::CodexExecutor::new(config.codex.clone()),
                         config.task_values.clone(),
                         config.journal_values.executor.clone(),
+                    )
+                    .with_retry_policy(
+                        config.runner.auto_retry_max_retries,
+                        config.runner.auto_retry_delay_seconds,
                     );
                     let coordinator = coordination::RevisionCoordinator::new(workflow);
                     let count = runtime.block_on(async {
