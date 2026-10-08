@@ -4,6 +4,7 @@ use crate::discovery::DiscoveredTask;
 use crate::executor::{Executor, ExecutorRequest, ExecutorResult, Outcome};
 use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,6 +17,8 @@ pub(crate) struct ExecutionWorkflow<N, E> {
     executor: Arc<E>,
     task_values: TaskValues,
     executor_name: String,
+    auto_retry_max_retries: u8,
+    auto_retry_delay_seconds: u64,
 }
 
 impl<N, E> ExecutionWorkflow<N, E> {
@@ -32,7 +35,15 @@ impl<N, E> ExecutionWorkflow<N, E> {
             executor: Arc::new(executor),
             task_values,
             executor_name,
+            auto_retry_max_retries: 2,
+            auto_retry_delay_seconds: 900,
         }
+    }
+
+    pub(crate) fn with_retry_policy(mut self, max_retries: u8, delay_seconds: u64) -> Self {
+        self.auto_retry_max_retries = max_retries;
+        self.auto_retry_delay_seconds = delay_seconds;
+        self
     }
 }
 
@@ -41,6 +52,130 @@ where
     N: NotionAdapter,
     E: Executor + 'static,
 {
+    // Previous attempts are durable and include an immutable run ID. Give
+    // recovered Codex invocations the original brief plus explicit context,
+    // including the crucial verify-before-write rule. Do not persist or log
+    // task instruction text in local state.
+    fn instructions_for_attempt(&self, task: &DiscoveredTask) -> Result<String, String> {
+        let previous = self
+            .store
+            .list_prepared()?
+            .into_iter()
+            .filter(|attempt| {
+                attempt.task_key() == task.state.page_id
+                    && attempt.task_revision() == Some(task.state.revision.as_str())
+                    && attempt.result().is_some()
+            })
+            .max_by(|left, right| {
+                left.completed_at()
+                    .cmp(&right.completed_at())
+                    .then_with(|| left.run_id().cmp(right.run_id()))
+            });
+        let Some(previous) = previous else {
+            return Ok(task.instructions.clone());
+        };
+        Ok(format!(
+            "# RECOVERY ATTEMPT (automatic)\n\n\
+             The previous Agent Handover run ID was: {}. Its outcome is \
+             uncertain or failed. This is a new, separately journaled \
+             attempt, not a continuation of that process.\n\n\
+             BEFORE ANY WRITE, FILE DELETE, UPLOAD OR EXTERNAL ACTION:\n\
+             1. Read the exact target state, prior work and relevant run \
+             results. Determine whether the original success criteria are \
+             already satisfied.\n\
+             2. If complete, verify and report success without repeating \
+             effects. Finish only outstanding cleanup that is independently safe.\n\
+             3. If partially complete, perform only verified missing \
+             idempotent steps. Avoid duplicate Notion blocks, messages or \
+             other effects.\n\
+             4. If prior effects cannot be determined, or repetition may be \
+             non-idempotent, STOP and return structured Error requesting \
+             human review; do not guess. Preserve source/staging files.\n\
+             Follow all original scope, authorization and validation rules.\n\n\
+             # ORIGINAL TASK\n\n{}",
+            previous.run_id(),
+            task.instructions
+        ))
+    }
+
+    fn is_automatic_retry_candidate(attempt: &PreparedAttempt) -> bool {
+        let Some(result) = attempt.result() else {
+            return false;
+        };
+        result.outcome == Outcome::Error
+            && (result.summary == "executor failed before returning a valid result"
+                || result.summary == "runner restarted after launch intent; outcome is unknown")
+    }
+
+    async fn resume_eligible_failures(&self) -> Result<usize, String> {
+        if self.auto_retry_max_retries == 0 {
+            return Ok(0);
+        }
+        let mut groups: HashMap<(String, String), Vec<PreparedAttempt>> = HashMap::new();
+        for attempt in self.store.list_prepared()? {
+            if let Some(revision) = attempt.task_revision() {
+                groups
+                    .entry((attempt.task_key().to_owned(), revision.to_owned()))
+                    .or_default()
+                    .push(attempt);
+            }
+        }
+        let mut resumed = 0;
+        for ((page_id, revision), mut attempts) in groups {
+            // A prepared or launched attempt must be recovered, not duplicated.
+            if attempts.iter().any(|attempt| attempt.result().is_none()) {
+                continue;
+            }
+            attempts.sort_by(|left, right| {
+                left.completed_at()
+                    .cmp(&right.completed_at())
+                    .then_with(|| left.run_id().cmp(right.run_id()))
+            });
+            let Some(last) = attempts.last() else {
+                continue;
+            };
+            if attempts.len() > usize::from(self.auto_retry_max_retries)
+                || !Self::is_automatic_retry_candidate(last)
+            {
+                continue;
+            }
+            let completed_at = OffsetDateTime::parse(
+                last.completed_at()
+                    .ok_or_else(|| "retry candidate lacks completion time".to_owned())?,
+                &Rfc3339,
+            )
+            .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
+            let backoff = self.auto_retry_delay_seconds.saturating_mul(
+                1_u64 << (attempts.len().saturating_sub(1).min(10)),
+            );
+            if (OffsetDateTime::now_utc() - completed_at)
+                < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
+            {
+                continue;
+            }
+            let observed = self.notion.refetch_task(&page_id).await?;
+            // An operator may have already retried, edited, or finished it.
+            // Only the runner-projected Error is eligible for resumption.
+            if observed.in_trash || observed.status.as_deref() != Some(&self.task_values.error) {
+                continue;
+            }
+            let instructions = self.notion.render_task(&page_id).await?;
+            self.launch(
+                DiscoveredTask {
+                    state: crate::notion::TaskState {
+                        revision: crate::notion::TaskRevision::parse(&revision)?,
+                        ..observed
+                    },
+                    instructions,
+                },
+                None,
+            )
+            .await?;
+            resumed += 1;
+        }
+        Ok(resumed)
+    }
+
     async fn launch(
         &self,
         task: DiscoveredTask,
@@ -74,11 +209,12 @@ where
         tracing::info!("task attempt prepared");
         self.store.record_launch_intent(ready.run_id())?;
         let run_id = ready.run_id().to_owned();
+        let instructions = self.instructions_for_attempt(&task)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
         let execution = tokio::task::spawn_blocking(move || {
             executor.execute(ExecutorRequest {
-                instructions: task.instructions,
+                instructions,
             })
         })
         .await;
@@ -287,6 +423,7 @@ where
                 self.launch(task, Some(attempt)).await?;
                 recovered += 1;
             }
+            recovered += self.resume_eligible_failures().await?;
             Ok(recovered)
         })
     }
