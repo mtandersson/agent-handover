@@ -164,7 +164,7 @@ where
             let observed = self.notion.refetch_task(&page_id).await?;
             // An operator may have already retried, edited, or finished it.
             // Only the runner-projected Error is eligible for resumption.
-            if observed.in_trash || observed.status.as_deref() != Some(&self.task_values.error) {
+            if observed.in_trash || observed.status.as_deref() != Some(self.task_values.error.as_str()) {
                 continue;
             }
             let instructions = self.notion.render_task(&page_id).await?;
