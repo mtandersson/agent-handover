@@ -1447,6 +1447,9 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        assert_eq!(store.list_prepared().unwrap()[0].result().unwrap().outcome, Outcome::Error);
+        assert!(store.result_stored().unwrap().is_empty());
         assert_eq!(calls.lock().unwrap().len(), 1);
         drop(workflow);
         drop(store);
