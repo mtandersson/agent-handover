@@ -497,6 +497,20 @@ where
 
     fn recover<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send + 'a>> {
         Box::pin(async move {
+            // Observe before recovering local runs, because a poisoned attempt
+            // can abort recovery. This read-only query must never block
+            // finalization, retries, or Pending discovery.
+            match self.count_stale_running_without_local_authority().await {
+                Ok(count) if count > 0 => tracing::warn!(
+                    count,
+                    "stale Running tasks lack private attempt authority; operator review required"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    category = "running_observation_failed",
+                    "stale Running observation failed; no orphan replay was attempted"
+                ),
+            }
             let results = self.store.result_stored()?;
             let finalized = results.len();
             for attempt in results {
@@ -537,19 +551,6 @@ where
                 recovered += 1;
             }
             recovered += self.resume_eligible_failures().await?;
-            // Monitoring must never prevent unrelated Pending discovery or
-            // attempt finalization when the Notion query is unavailable.
-            match self.count_stale_running_without_local_authority().await {
-                Ok(count) if count > 0 => tracing::warn!(
-                    count,
-                    "stale Running tasks lack private attempt authority; operator review required"
-                ),
-                Ok(_) => {}
-                Err(_) => tracing::warn!(
-                    category = "running_observation_failed",
-                    "stale Running observation failed; no retry was launched"
-                ),
-            }
             Ok(recovered)
         })
     }
