@@ -4,7 +4,7 @@ use crate::discovery::DiscoveredTask;
 use crate::executor::{Executor, ExecutorRequest, ExecutorResult, Outcome};
 use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ pub(crate) struct ExecutionWorkflow<N, E> {
     executor_name: String,
     auto_retry_max_retries: u8,
     auto_retry_delay_seconds: u64,
+    stale_running_threshold_seconds: u64,
 }
 
 impl<N, E> ExecutionWorkflow<N, E> {
@@ -37,12 +38,18 @@ impl<N, E> ExecutionWorkflow<N, E> {
             executor_name,
             auto_retry_max_retries: 2,
             auto_retry_delay_seconds: 900,
+            stale_running_threshold_seconds: 3600,
         }
     }
 
     pub(crate) fn with_retry_policy(mut self, max_retries: u8, delay_seconds: u64) -> Self {
         self.auto_retry_max_retries = max_retries;
         self.auto_retry_delay_seconds = delay_seconds;
+        self
+    }
+
+    pub(crate) fn with_stale_running_threshold_seconds(mut self, seconds: u64) -> Self {
+        self.stale_running_threshold_seconds = seconds;
         self
     }
 }
@@ -184,6 +191,81 @@ where
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    // This is an observation only: the Notion "last edited" time is an age
+    // proxy, not proof that an executor stopped. Missing private local state
+    // must never authorize a replay, status mutation, or a second process.
+    async fn count_stale_running_without_local_authority(&self) -> Result<usize, String> {
+        const MAX_PAGES: usize = 100;
+        const MAX_TASKS: usize = 10_000;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+        let locally_known: HashSet<_> = self
+            .store
+            .list_prepared()?
+            .into_iter()
+            .map(|attempt| attempt.task_key().to_owned())
+            .collect();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_tasks = HashSet::new();
+        let mut total_bytes = 0usize;
+        let now = OffsetDateTime::now_utc();
+        let min_age = time::Duration::seconds(
+            i64::try_from(self.stale_running_threshold_seconds).unwrap_or(i64::MAX),
+        );
+        let mut count = 0usize;
+        let mut completed_scan = false;
+
+        for _ in 0..MAX_PAGES {
+            // The adapter's status argument is a query filter. Request
+            // Running rather than the usual Pending without dispatching it.
+            let page = self
+                .notion
+                .query_pending_tasks(cursor.as_deref(), &self.task_values.running)
+                .await?;
+            total_bytes = total_bytes
+                .checked_add(page.response_bytes)
+                .filter(|bytes| *bytes <= MAX_BYTES)
+                .ok_or_else(|| "Running task observation exceeds the size limit".to_owned())?;
+            if seen_tasks.len().saturating_add(page.tasks.len()) > MAX_TASKS {
+                return Err("Running task observation exceeds the task limit".to_owned());
+            }
+            for observed in page.tasks {
+                if !seen_tasks.insert(observed.page_id.clone())
+                    || observed.in_trash
+                    || observed.status.as_deref() != Some(self.task_values.running.as_str())
+                    || locally_known.contains(&observed.page_id)
+                    || now - observed.revision.instant() < min_age
+                {
+                    continue;
+                }
+
+                // Recheck before reporting to avoid counting rows that were
+                // edited or completed between pagination and inspection.
+                let current = self.notion.refetch_task(&observed.page_id).await?;
+                if current.page_id == observed.page_id
+                    && current.revision == observed.revision
+                    && !current.in_trash
+                    && current.status.as_deref() == Some(self.task_values.running.as_str())
+                {
+                    count += 1;
+                }
+            }
+            match page.next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => return Err("Running task observation contains a cursor cycle".to_owned()),
+                None => {
+                    completed_scan = true;
+                    break;
+                }
+            }
+        }
+        if !completed_scan {
+            return Err("Running task observation exceeds the page limit".to_owned());
+        }
+        Ok(count)
     }
 
     async fn launch(
@@ -456,6 +538,19 @@ where
                 recovered += 1;
             }
             recovered += self.resume_eligible_failures().await?;
+            // Monitoring must never prevent unrelated Pending discovery or
+            // attempt finalization when the Notion query is unavailable.
+            match self.count_stale_running_without_local_authority().await {
+                Ok(count) if count > 0 => tracing::warn!(
+                    count,
+                    "stale Running tasks lack private attempt authority; operator review required"
+                ),
+                Ok(_) => {},
+                Err(_) => tracing::warn!(
+                    category = "running_observation_failed",
+                    "stale Running observation failed; no retry was launched"
+                ),
+            }
             Ok(recovered)
         })
     }
@@ -1483,6 +1578,80 @@ mod tests {
         assert_eq!(store.list_prepared().unwrap()[0].result().unwrap().outcome, Outcome::Error);
         assert!(store.result_stored().unwrap().is_empty());
         assert_eq!(calls.lock().unwrap().len(), 1);
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_running_without_local_state_is_observed_but_never_relaunched() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(0);
+
+        assert_eq!(
+            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            1
+        );
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(store.list_prepared().unwrap().is_empty());
+        // Private attempt authority, even for a prepared run, prevents the
+        // unrelated orphan alarm from claiming the task is unknown.
+        store.prepare("task-placeholder").unwrap();
+        assert_eq!(
+            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            0
+        );
+        notion.state.lock().unwrap().visible_status = Some("Done".to_owned());
+        assert_eq!(
+            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            0
+        );
+
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_running_task_is_not_marked_stale() {
+        let state_directory = directory();
+        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                notion,
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(10 * 365 * 24 * 60 * 60);
+        assert_eq!(
+            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            0
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
