@@ -50,7 +50,10 @@ pub(crate) fn serve<T: EnrollmentSource>(
         config.runner.auto_retry_delay_seconds,
     )
     .with_stale_running_threshold_seconds(
-        config.codex.timeout_seconds.saturating_add(config.runner.stale_running_grace_seconds),
+        config
+            .codex
+            .timeout_seconds
+            .saturating_add(config.runner.stale_running_grace_seconds),
     );
     let coordinator = Arc::new(RevisionCoordinator::new(workflow));
     let dispatcher = NotionEventDispatcher::with_coordinator(
