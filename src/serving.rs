@@ -48,6 +48,12 @@ pub(crate) fn serve<T: EnrollmentSource>(
     .with_retry_policy(
         config.runner.auto_retry_max_retries,
         config.runner.auto_retry_delay_seconds,
+    )
+    .with_stale_running_threshold_seconds(
+        config
+            .codex
+            .timeout_seconds
+            .saturating_add(config.runner.stale_running_grace_seconds),
     );
     let coordinator = Arc::new(RevisionCoordinator::new(workflow));
     let dispatcher = NotionEventDispatcher::with_coordinator(
@@ -539,6 +545,7 @@ mod tests {
                 reconciliation_interval_seconds: interval,
                 auto_retry_max_retries: 2,
                 auto_retry_delay_seconds: 900,
+                stale_running_grace_seconds: 900,
                 bind_address: "127.0.0.1:0".to_owned(),
                 webhook_path: "/notion/webhook".to_owned(),
                 health_path: "/health".to_owned(),

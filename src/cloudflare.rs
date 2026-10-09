@@ -592,6 +592,9 @@ mod tests {
     fn runner() -> RunnerConfig {
         RunnerConfig {
             reconciliation_interval_seconds: 60,
+            auto_retry_max_retries: 2,
+            auto_retry_delay_seconds: 900,
+            stale_running_grace_seconds: 900,
             bind_address: "127.0.0.1:8080".into(),
             webhook_path: "/notion/webhook".into(),
             health_path: "/health".into(),

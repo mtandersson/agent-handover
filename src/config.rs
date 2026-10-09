@@ -356,6 +356,8 @@ pub struct RunnerConfig {
     pub auto_retry_max_retries: u8,
     #[serde(default = "default_auto_retry_delay_seconds")]
     pub auto_retry_delay_seconds: u64,
+    #[serde(default = "default_stale_running_grace_seconds")]
+    pub stale_running_grace_seconds: u64,
     pub bind_address: String,
     pub webhook_path: String,
     pub health_path: String,
@@ -366,6 +368,10 @@ fn default_auto_retry_max_retries() -> u8 {
 }
 
 fn default_auto_retry_delay_seconds() -> u64 {
+    900
+}
+
+fn default_stale_running_grace_seconds() -> u64 {
     900
 }
 
@@ -967,9 +973,11 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(runner.auto_retry_max_retries, 2);
         assert_eq!(runner.auto_retry_delay_seconds, 900);
+        assert_eq!(runner.stale_running_grace_seconds, 900);
         let opt_out: RunnerConfig = toml::from_str(
             r#"reconciliation_interval_seconds = 60
 auto_retry_max_retries = 0
@@ -978,7 +986,8 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opt_out.auto_retry_max_retries, 0);
         assert_eq!(opt_out.auto_retry_delay_seconds, 60);
     }
