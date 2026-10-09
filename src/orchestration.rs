@@ -160,9 +160,9 @@ where
                 &Rfc3339,
             )
             .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
-            let backoff = self.auto_retry_delay_seconds.saturating_mul(
-                1_u64 << (current_revision_attempts.saturating_sub(1).min(10)),
-            );
+            let backoff = self
+                .auto_retry_delay_seconds
+                .saturating_mul(1_u64 << (current_revision_attempts.saturating_sub(1).min(10)));
             if (OffsetDateTime::now_utc() - completed_at)
                 < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
             {
@@ -255,7 +255,9 @@ where
             }
             match page.next_cursor {
                 Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
-                Some(_) => return Err("Running task observation contains a cursor cycle".to_owned()),
+                Some(_) => {
+                    return Err("Running task observation contains a cursor cycle".to_owned());
+                }
                 None => {
                     completed_scan = true;
                     break;
@@ -304,12 +306,9 @@ where
         let instructions = self.instructions_for_attempt(&task)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
-        let execution = tokio::task::spawn_blocking(move || {
-            executor.execute(ExecutorRequest {
-                instructions,
-            })
-        })
-        .await;
+        let execution =
+            tokio::task::spawn_blocking(move || executor.execute(ExecutorRequest { instructions }))
+                .await;
         // Once launch_intent is durable every executor failure must cross the
         // same durable-result boundary as a normal agent Error. Otherwise the
         // task stays Running until a runner restart, with an unfinished journal.
@@ -545,7 +544,7 @@ where
                     count,
                     "stale Running tasks lack private attempt authority; operator review required"
                 ),
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(_) => tracing::warn!(
                     category = "running_observation_failed",
                     "stale Running observation failed; no retry was launched"
@@ -1586,7 +1585,11 @@ mod tests {
     #[tokio::test]
     async fn stale_running_without_local_state_is_observed_but_never_relaunched() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1615,12 +1618,18 @@ mod tests {
         // unrelated orphan alarm from claiming the task is unknown.
         store.prepare("task-placeholder").unwrap();
         assert_eq!(
-            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
             0
         );
         notion.state.lock().unwrap().visible_status = Some("Done".to_owned());
         assert_eq!(
-            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
             0
         );
 
@@ -1632,7 +1641,11 @@ mod tests {
     #[tokio::test]
     async fn recent_running_task_is_not_marked_stale() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
         let workflow = ExecutionWorkflow::new(
@@ -1649,7 +1662,10 @@ mod tests {
         )
         .with_stale_running_threshold_seconds(10 * 365 * 24 * 60 * 60);
         assert_eq!(
-            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
             0
         );
         drop(workflow);
@@ -1660,17 +1676,26 @@ mod tests {
     #[tokio::test]
     async fn automatic_retry_records_distinct_runs_and_verify_first_context() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
-                calls: Arc::clone(&calls), notion: notion.clone(),
-                fail: true, outcome: Outcome::Done,
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: true,
+                outcome: Outcome::Done,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 0);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 0);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         let first = store.list_prepared().unwrap()[0].run_id().to_owned();
         assert!(workflow.recover().await.is_err());
@@ -1684,8 +1709,15 @@ mod tests {
         drop(calls);
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 3);
-        assert!(attempts.iter().all(|a| a.result().unwrap().outcome == Outcome::Error));
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.result().unwrap().outcome == Outcome::Error)
+        );
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
@@ -1694,17 +1726,26 @@ mod tests {
     #[tokio::test]
     async fn automatic_retry_obeys_backoff_and_excludes_agent_errors() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
-                calls: Arc::clone(&calls), notion: notion.clone(),
-                fail: true, outcome: Outcome::Done,
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: true,
+                outcome: Outcome::Done,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 3600);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 3600);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         assert_eq!(workflow.recover().await.unwrap(), 0);
         assert_eq!(calls.lock().unwrap().len(), 1);
