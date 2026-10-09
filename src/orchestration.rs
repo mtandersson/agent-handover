@@ -1574,8 +1574,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
-        assert_eq!(store.list_prepared().unwrap()[0].result().unwrap().outcome, Outcome::Error);
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            store.list_prepared().unwrap()[0].result().unwrap().outcome,
+            Outcome::Error
+        );
         assert!(store.result_stored().unwrap().is_empty());
         assert_eq!(calls.lock().unwrap().len(), 1);
         drop(workflow);
@@ -1609,7 +1615,10 @@ mod tests {
         .with_stale_running_threshold_seconds(0);
 
         assert_eq!(
-            workflow.count_stale_running_without_local_authority().await.unwrap(),
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
             1
         );
         assert_eq!(workflow.recover().await.unwrap(), 0);
@@ -1755,16 +1764,25 @@ mod tests {
         std::fs::remove_dir_all(state_directory).unwrap();
 
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
                 calls: Arc::new(Mutex::new(Vec::new())),
-                notion, fail: false, outcome: Outcome::Error,
+                notion,
+                fail: false,
+                outcome: Outcome::Error,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 0);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 0);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         assert_eq!(workflow.recover().await.unwrap(), 0);
         assert_eq!(store.list_prepared().unwrap().len(), 1);
