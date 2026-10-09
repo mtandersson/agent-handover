@@ -967,7 +967,8 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(runner.auto_retry_max_retries, 2);
         assert_eq!(runner.auto_retry_delay_seconds, 900);
         let opt_out: RunnerConfig = toml::from_str(
@@ -978,7 +979,8 @@ bind_address = "127.0.0.1:8080"
 webhook_path = "/notion/webhook"
 health_path = "/health"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(opt_out.auto_retry_max_retries, 0);
         assert_eq!(opt_out.auto_retry_delay_seconds, 60);
     }

@@ -422,6 +422,8 @@ mod tests {
     fn config(address: &str) -> RunnerConfig {
         RunnerConfig {
             reconciliation_interval_seconds: 60,
+            auto_retry_max_retries: 2,
+            auto_retry_delay_seconds: 900,
             bind_address: address.to_owned(),
             webhook_path: "/custom/webhook".to_owned(),
             health_path: "/custom/health".to_owned(),

@@ -153,9 +153,9 @@ where
                 &Rfc3339,
             )
             .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
-            let backoff = self.auto_retry_delay_seconds.saturating_mul(
-                1_u64 << (current_revision_attempts.saturating_sub(1).min(10)),
-            );
+            let backoff = self
+                .auto_retry_delay_seconds
+                .saturating_mul(1_u64 << (current_revision_attempts.saturating_sub(1).min(10)));
             if (OffsetDateTime::now_utc() - completed_at)
                 < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
             {
@@ -222,12 +222,9 @@ where
         let instructions = self.instructions_for_attempt(&task)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
-        let execution = tokio::task::spawn_blocking(move || {
-            executor.execute(ExecutorRequest {
-                instructions,
-            })
-        })
-        .await;
+        let execution =
+            tokio::task::spawn_blocking(move || executor.execute(ExecutorRequest { instructions }))
+                .await;
         // Once launch_intent is durable every executor failure must cross the
         // same durable-result boundary as a normal agent Error. Otherwise the
         // task stays Running until a runner restart, with an unfinished journal.
@@ -1479,8 +1476,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
-        assert_eq!(store.list_prepared().unwrap()[0].result().unwrap().outcome, Outcome::Error);
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
+        assert_eq!(
+            store.list_prepared().unwrap()[0].result().unwrap().outcome,
+            Outcome::Error
+        );
         assert!(store.result_stored().unwrap().is_empty());
         assert_eq!(calls.lock().unwrap().len(), 1);
         drop(workflow);
@@ -1491,17 +1494,26 @@ mod tests {
     #[tokio::test]
     async fn automatic_retry_records_distinct_runs_and_verify_first_context() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
-                calls: Arc::clone(&calls), notion: notion.clone(),
-                fail: true, outcome: Outcome::Done,
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: true,
+                outcome: Outcome::Done,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 0);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 0);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         let first = store.list_prepared().unwrap()[0].run_id().to_owned();
         assert!(workflow.recover().await.is_err());
@@ -1515,8 +1527,15 @@ mod tests {
         drop(calls);
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 3);
-        assert!(attempts.iter().all(|a| a.result().unwrap().outcome == Outcome::Error));
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.result().unwrap().outcome == Outcome::Error)
+        );
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
@@ -1525,17 +1544,26 @@ mod tests {
     #[tokio::test]
     async fn automatic_retry_obeys_backoff_and_excludes_agent_errors() {
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let calls = Arc::new(Mutex::new(Vec::new()));
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
-                calls: Arc::clone(&calls), notion: notion.clone(),
-                fail: true, outcome: Outcome::Done,
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: true,
+                outcome: Outcome::Done,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 3600);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 3600);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         assert_eq!(workflow.recover().await.unwrap(), 0);
         assert_eq!(calls.lock().unwrap().len(), 1);
@@ -1544,16 +1572,25 @@ mod tests {
         std::fs::remove_dir_all(state_directory).unwrap();
 
         let state_directory = directory();
-        let store = Arc::new(AttemptStore::new(state_directory.clone()).acquire().unwrap());
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
         let notion = FakeNotion::new();
         let workflow = ExecutionWorkflow::new(
-            Arc::clone(&store), notion.clone(),
+            Arc::clone(&store),
+            notion.clone(),
             FakeExecutor {
                 calls: Arc::new(Mutex::new(Vec::new())),
-                notion, fail: false, outcome: Outcome::Error,
+                notion,
+                fail: false,
+                outcome: Outcome::Error,
             },
-            values(), "Codex".to_owned(),
-        ).with_retry_policy(2, 0);
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 0);
         assert!(workflow.prepare(discovered("original")).await.is_err());
         assert_eq!(workflow.recover().await.unwrap(), 0);
         assert_eq!(store.list_prepared().unwrap().len(), 1);
