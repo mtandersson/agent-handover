@@ -417,6 +417,9 @@ fn main() -> ExitCode {
                     .with_retry_policy(
                         config.runner.auto_retry_max_retries,
                         config.runner.auto_retry_delay_seconds,
+                    )
+                    .with_stale_running_threshold_seconds(
+                        config.codex.timeout_seconds.saturating_add(config.runner.stale_running_grace_seconds),
                     );
                     let coordinator = coordination::RevisionCoordinator::new(workflow);
                     let count = runtime.block_on(async {
