@@ -1,3 +1,52 @@
+## [0.13.0](https://github.com/mtandersson/agent-handover/compare/v0.12.0...v0.13.0) (2026-10-19)
+
+### Features
+
+* configure bounded automatic recovery retry policy ([83b6885](https://github.com/mtandersson/agent-handover/commit/83b68852e276e55b836dac452af51240ae8f173d))
+* persist bounded automatic recovery attempts with verify-before-write context ([3fd3366](https://github.com/mtandersson/agent-handover/commit/3fd3366cf18de2f4d662d2b2d0b8ba2f8a5e90d9))
+* wire recovery policy into runner ([fc83e27](https://github.com/mtandersson/agent-handover/commit/fc83e2705607ace2439c6625a0e3d5bde68cd90f))
+* wire recovery policy into runner ([81c26e4](https://github.com/mtandersson/agent-handover/commit/81c26e48a71c516f37e988540018917c93d7d25f))
+
+### Bug Fixes
+
+* classify executor failures without persisting untrusted process output ([124db6a](https://github.com/mtandersson/agent-handover/commit/124db6a1d6ea25f8d3d5466a60b6c02a27158feb))
+* compare status against explicit str in recovery preflight ([01ef7f3](https://github.com/mtandersson/agent-handover/commit/01ef7f3d3cda918924f604f45f744e64d9578075))
+* durably finalize failed Codex launches instead of leaving Running ([746638f](https://github.com/mtandersson/agent-handover/commit/746638fcfdfce7b07b69686c30c1a95e2eed48d4))
+* keep pending task discovery available when old-attempt recovery fails ([e51069e](https://github.com/mtandersson/agent-handover/commit/e51069e27e2e7b9d608c394f8433da6c4f5ebc34))
+* never resurrect old failed revisions after a newer attempt ([7c9ebdc](https://github.com/mtandersson/agent-handover/commit/7c9ebdcc9f2c61c1bcc75e461bc2f24e3546776b))
+* revisit interrupted and recoverable attempts on reconciliation ticks ([c1a3f91](https://github.com/mtandersson/agent-handover/commit/c1a3f9161c6ae25c78373ac574bc83aee21ddb0b))
+
+### Documentation
+
+* explain bounded automatic recovery and stale Running limitations ([405d395](https://github.com/mtandersson/agent-handover/commit/405d39526f995a8ba0c76233a8c918af8e97371d))
+
+### Styles
+
+* fix rustfmt failure blocking release ([#108](https://github.com/mtandersson/agent-handover/issues/108)) ([bc9c9ef](https://github.com/mtandersson/agent-handover/commit/bc9c9efe86c7c5e0e26c39d6a7d10ac3c84338f6))
+
+### Tests
+
+* assert failed executor closes journal and task ([8718128](https://github.com/mtandersson/agent-handover/commit/871812883733f331828a729b4cdfe7ecc5bbda8a))
+* bound retry count and enforce backoff and recovery instructions ([5b2ffd3](https://github.com/mtandersson/agent-handover/commit/5b2ffd3366b29d47b63363e3d3f50e2f7651073a))
+* populate recovery defaults in serving fixture ([c260957](https://github.com/mtandersson/agent-handover/commit/c26095778f7ed2ccfef6441ffe17b07d16de112a))
+* retain fake adapter for terminal assertion ([99f82fc](https://github.com/mtandersson/agent-handover/commit/99f82fcdbdf7f879238cf55a7005d0324d94ec08))
+* verify compatible retry defaults and explicit opt-out ([6db4524](https://github.com/mtandersson/agent-handover/commit/6db45240bcc34325717bf5daca40ca5fb0afa5f0))
+
+### Chores
+
+* **deps:** update rust crate hyper to v1.12.0 ([#103](https://github.com/mtandersson/agent-handover/issues/103)) ([6a6da9b](https://github.com/mtandersson/agent-handover/commit/6a6da9b3b25c3c9d611ca521d11ad4b14dc3ff83))
+* **deps:** update rust crate hyper-util to v0.1.21 ([#99](https://github.com/mtandersson/agent-handover/issues/99)) ([deb79ff](https://github.com/mtandersson/agent-handover/commit/deb79ff186b0b72d8f88fffbe30eabef7e9a2074))
+* **deps:** update rust crate libc to v0.2.190 ([#100](https://github.com/mtandersson/agent-handover/issues/100)) ([3b6de02](https://github.com/mtandersson/agent-handover/commit/3b6de022c8f8bd8da05547b0ab7897aadf960910))
+* **deps:** update rust crate libc to v0.2.191 ([#114](https://github.com/mtandersson/agent-handover/issues/114)) ([9578097](https://github.com/mtandersson/agent-handover/commit/95780974efb66cfef2fa9cbf242834ee33e9abcf))
+* **deps:** update rust crate serde_json to v1.0.152 ([#110](https://github.com/mtandersson/agent-handover/issues/110)) ([44f7ef9](https://github.com/mtandersson/agent-handover/commit/44f7ef9f39169f558a78baa1ff0eaa61a79b3955))
+* **deps:** update rust crate serde_json to v1.0.154 ([#111](https://github.com/mtandersson/agent-handover/issues/111)) ([6a68d7e](https://github.com/mtandersson/agent-handover/commit/6a68d7e91aa50f9c05c8e23aa0c53b68494d221e))
+* **deps:** update rust crate sha2 to v0.11.1 ([#112](https://github.com/mtandersson/agent-handover/issues/112)) ([bb23f98](https://github.com/mtandersson/agent-handover/commit/bb23f98143dca345927cd97bb841cdadf0fb9137))
+* **deps:** update rust crate tokio to v1.53.2 ([#102](https://github.com/mtandersson/agent-handover/issues/102)) ([e2db916](https://github.com/mtandersson/agent-handover/commit/e2db9169271d98a3cd974e40bd6069881f418abf))
+* **deps:** update rust crate tokio to v1.53.3 ([#113](https://github.com/mtandersson/agent-handover/issues/113)) ([afe3e33](https://github.com/mtandersson/agent-handover/commit/afe3e33bd4e1a82f8681e1b5cbab857dbcb9b4a6))
+* **deps:** update rust crate toml to v1.1.8 ([#104](https://github.com/mtandersson/agent-handover/issues/104)) ([3717fc7](https://github.com/mtandersson/agent-handover/commit/3717fc79532890e7eb898d3520c889b22d7bc422))
+* **deps:** update rust crate uuid to v1.27.0 ([#101](https://github.com/mtandersson/agent-handover/issues/101)) ([6302340](https://github.com/mtandersson/agent-handover/commit/63023403e3423041838c23835487713d40cae223))
+* **deps:** update rust crate uuid to v1.28.0 ([#109](https://github.com/mtandersson/agent-handover/issues/109)) ([65f72d5](https://github.com/mtandersson/agent-handover/commit/65f72d5403ac178d3661266d9196fec43a4f06e9))
+
 ## [0.12.0](https://github.com/mtandersson/agent-handover/compare/v0.11.0...v0.12.0) (2026-09-21)
 
 ### Features
