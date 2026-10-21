@@ -1809,12 +1809,13 @@ mod tests {
             .recover_orphan("task-placeholder", previous)
             .await
             .unwrap();
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].contains("RECOVERY ATTEMPT (supervised orphan recovery"));
-        assert!(calls[0].contains(previous));
-        assert!(calls[0].contains("BEFORE ANY WRITE"));
-        drop(calls);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].contains("RECOVERY ATTEMPT (supervised orphan recovery"));
+            assert!(calls[0].contains(previous));
+            assert!(calls[0].contains("BEFORE ANY WRITE"));
+        }
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
