@@ -1818,12 +1818,14 @@ mod tests {
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
-        assert!(attempts[0]
-            .result()
-            .unwrap()
-            .warnings
-            .iter()
-            .any(|w| w.contains(previous)));
+        assert!(
+            attempts[0]
+                .result()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|w| w.contains(previous))
+        );
         assert_ne!(attempts[0].run_id(), previous);
         assert_eq!(
             notion.state.lock().unwrap().visible_status.as_deref(),
