@@ -88,6 +88,24 @@ tasks are made visibly `Running`, executed one at a time, have their validated
 result saved in private durable state, and are finalized in the shared journal
 before their task status becomes `Done` or `Error`.
 
+### Inspecting orphaned Running tasks
+
+On startup and periodic recovery, the runner also **observes** Notion tasks
+with `Status = Running` whose last edited timestamp is older than
+`codex.timeout_seconds + runner.stale_running_grace_seconds` (default
+15 minutes of grace). If no local attempt record exists, it emits a
+privacy-safe aggregate warning with the number of suspected orphans.
+
+This is an **alert only**, not evidence that the previous process ended.
+The runner does not reset such tasks to Pending, overwrite a Run Journal,
+or automatically replay them. The timestamp is only a conservative age
+proxy; Notion edits can affect it. An operator must compare the Notion
+Run Journal with private XDG state and inspect any downstream effects
+before deciding on a manual recovery. Look for the log message
+`stale Running tasks lack private attempt authority`, then identify
+matching Running rows in Notion without exposing IDs in logs. Recovery
+must use a new linked attempt and verify prior effects before writing.
+
 ### Operational logging
 
 The service writes privacy-safe lifecycle logs to standard error. `info` logs
@@ -510,13 +528,23 @@ non-idempotent operation.
 # Also supply the normal reconciliation, bind, webhook and health fields.
 auto_retry_max_retries = 2
 auto_retry_delay_seconds = 900
+# Running tasks older than Codex timeout + this grace are observed only.
+stale_running_grace_seconds = 900
+# Keep quota-blocked work pending for up to one week of hourly retries.
+quota_retry_max_retries = 168
+quota_retry_delay_seconds = 3600
 ```
 
-Both values have these defaults when omitted. The delay is 15 minutes after
+All five values have these defaults when omitted. The normal delay is 15 minutes after
 the first failure and increases exponentially for subsequent recoveries. Set
 `auto_retry_max_retries = 0` to disable automated reattempts. Retry counts
 are recovered from durable records across restarts. Individual run IDs still
-launch at most once. Local record and journal history must be retained.
+launch at most once. Quota/rate-limit nonzero exits recognized from bounded,
+private Codex stderr diagnostics receive a separate retry budget: at most 168
+extra attempts spaced one hour apart by default. No raw stderr is persisted
+or logged. This is periodic probing, not knowledge of the provider's reset time.
+Generic executor errors retain their own two-retry budget. Local record and
+journal history must be retained.
 
 **Limitations:** tasks left in `Running` without matching private local durable
 attempt state cannot be safely auto-resumed: the runner cannot establish

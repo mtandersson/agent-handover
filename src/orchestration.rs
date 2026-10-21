@@ -4,7 +4,7 @@ use crate::discovery::DiscoveredTask;
 use crate::executor::{Executor, ExecutorRequest, ExecutorResult, Outcome};
 use crate::notion::{FinalJournalAttempt, InitialJournalAttempt, NotionAdapter};
 use crate::state::{LockedAttemptStore, PreparedAttempt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -19,6 +19,9 @@ pub(crate) struct ExecutionWorkflow<N, E> {
     executor_name: String,
     auto_retry_max_retries: u8,
     auto_retry_delay_seconds: u64,
+    quota_retry_max_retries: u16,
+    quota_retry_delay_seconds: u64,
+    stale_running_threshold_seconds: u64,
 }
 
 impl<N, E> ExecutionWorkflow<N, E> {
@@ -37,12 +40,26 @@ impl<N, E> ExecutionWorkflow<N, E> {
             executor_name,
             auto_retry_max_retries: 2,
             auto_retry_delay_seconds: 900,
+            quota_retry_max_retries: 168,
+            quota_retry_delay_seconds: 3600,
+            stale_running_threshold_seconds: 3600,
         }
     }
 
     pub(crate) fn with_retry_policy(mut self, max_retries: u8, delay_seconds: u64) -> Self {
         self.auto_retry_max_retries = max_retries;
         self.auto_retry_delay_seconds = delay_seconds;
+        self
+    }
+
+    pub(crate) fn with_quota_retry_policy(mut self, max_retries: u16, delay_seconds: u64) -> Self {
+        self.quota_retry_max_retries = max_retries;
+        self.quota_retry_delay_seconds = delay_seconds;
+        self
+    }
+
+    pub(crate) fn with_stale_running_threshold_seconds(mut self, seconds: u64) -> Self {
+        self.stale_running_threshold_seconds = seconds;
         self
     }
 }
@@ -107,6 +124,15 @@ where
                 || result.summary == "runner restarted after launch intent; outcome is unknown")
     }
 
+    fn is_quota_failure(attempt: &PreparedAttempt) -> bool {
+        attempt.result().is_some_and(|result| {
+            result.summary == "executor failed before returning a valid result"
+                && result.warnings.iter().any(|warning| {
+                    warning == "executor failure (quota_exhausted); partial external effects may have occurred"
+                })
+        })
+    }
+
     async fn resume_eligible_failures(&self) -> Result<usize, String> {
         if self.auto_retry_max_retries == 0 {
             return Ok(0);
@@ -138,13 +164,20 @@ where
             let Some(revision) = last.task_revision() else {
                 continue;
             };
-            let current_revision_attempts = attempts
+            let quota_failure = Self::is_quota_failure(last);
+            let policy_attempts = attempts
                 .iter()
-                .filter(|attempt| attempt.task_revision() == Some(revision))
+                .filter(|attempt| {
+                    attempt.task_revision() == Some(revision)
+                        && Self::is_quota_failure(attempt) == quota_failure
+                })
                 .count();
-            if current_revision_attempts > usize::from(self.auto_retry_max_retries)
-                || !Self::is_automatic_retry_candidate(last)
-            {
+            let max_retries = if quota_failure {
+                usize::from(self.quota_retry_max_retries)
+            } else {
+                usize::from(self.auto_retry_max_retries)
+            };
+            if policy_attempts > max_retries || !Self::is_automatic_retry_candidate(last) {
                 continue;
             }
             let completed_at = OffsetDateTime::parse(
@@ -153,9 +186,13 @@ where
                 &Rfc3339,
             )
             .map_err(|_| "retry candidate completion time is invalid".to_owned())?;
-            let backoff = self
-                .auto_retry_delay_seconds
-                .saturating_mul(1_u64 << (current_revision_attempts.saturating_sub(1).min(10)));
+            // Quota exhaustion gets a longer, independently bounded retry budget.
+            let backoff = if quota_failure {
+                self.quota_retry_delay_seconds
+            } else {
+                self.auto_retry_delay_seconds
+                    .saturating_mul(1_u64 << (policy_attempts.saturating_sub(1).min(10)))
+            };
             if (OffsetDateTime::now_utc() - completed_at)
                 < time::Duration::seconds(i64::try_from(backoff).unwrap_or(i64::MAX))
             {
@@ -184,6 +221,83 @@ where
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    // This is an observation only: the Notion "last edited" time is an age
+    // proxy, not proof that an executor stopped. Missing private local state
+    // must never authorize a replay, status mutation, or a second process.
+    async fn count_stale_running_without_local_authority(&self) -> Result<usize, String> {
+        const MAX_PAGES: usize = 100;
+        const MAX_TASKS: usize = 10_000;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+
+        let locally_known: HashSet<_> = self
+            .store
+            .list_prepared()?
+            .into_iter()
+            .map(|attempt| attempt.task_key().to_owned())
+            .collect();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut seen_tasks = HashSet::new();
+        let mut total_bytes = 0usize;
+        let now = OffsetDateTime::now_utc();
+        let min_age = time::Duration::seconds(
+            i64::try_from(self.stale_running_threshold_seconds).unwrap_or(i64::MAX),
+        );
+        let mut count = 0usize;
+        let mut completed_scan = false;
+
+        for _ in 0..MAX_PAGES {
+            // The adapter's status argument is a query filter. Request
+            // Running rather than the usual Pending without dispatching it.
+            let page = self
+                .notion
+                .query_pending_tasks(cursor.as_deref(), &self.task_values.running)
+                .await?;
+            total_bytes = total_bytes
+                .checked_add(page.response_bytes)
+                .filter(|bytes| *bytes <= MAX_BYTES)
+                .ok_or_else(|| "Running task observation exceeds the size limit".to_owned())?;
+            if seen_tasks.len().saturating_add(page.tasks.len()) > MAX_TASKS {
+                return Err("Running task observation exceeds the task limit".to_owned());
+            }
+            for observed in page.tasks {
+                if !seen_tasks.insert(observed.page_id.clone())
+                    || observed.in_trash
+                    || observed.status.as_deref() != Some(self.task_values.running.as_str())
+                    || locally_known.contains(&observed.page_id)
+                    || now - observed.revision.instant() < min_age
+                {
+                    continue;
+                }
+
+                // Recheck before reporting to avoid counting rows that were
+                // edited or completed between pagination and inspection.
+                let current = self.notion.refetch_task(&observed.page_id).await?;
+                if current.page_id == observed.page_id
+                    && current.revision == observed.revision
+                    && !current.in_trash
+                    && current.status.as_deref() == Some(self.task_values.running.as_str())
+                {
+                    count += 1;
+                }
+            }
+            match page.next_cursor {
+                Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                Some(_) => {
+                    return Err("Running task observation contains a cursor cycle".to_owned());
+                }
+                None => {
+                    completed_scan = true;
+                    break;
+                }
+            }
+        }
+        if !completed_scan {
+            return Err("Running task observation exceeds the page limit".to_owned());
+        }
+        Ok(count)
     }
 
     async fn launch(
@@ -234,6 +348,7 @@ where
             Ok(Err(reason)) => {
                 let category = match reason.as_str() {
                     "Codex executor timed out" => "timeout",
+                    "Codex executor quota exhausted" => "quota_exhausted",
                     "Codex executor exited unsuccessfully" => "nonzero_exit",
                     "Codex executor could not be started" => "launch_failed",
                     "Codex executor did not produce a result" => "no_result",
@@ -413,6 +528,20 @@ where
 
     fn recover<'a>(&'a self) -> Pin<Box<dyn Future<Output = Result<usize, String>> + Send + 'a>> {
         Box::pin(async move {
+            // Observe before recovering local runs, because a poisoned attempt
+            // can abort recovery. This read-only query must never block
+            // finalization, retries, or Pending discovery.
+            match self.count_stale_running_without_local_authority().await {
+                Ok(count) if count > 0 => tracing::warn!(
+                    count,
+                    "stale Running tasks lack private attempt authority; operator review required"
+                ),
+                Ok(_) => {}
+                Err(_) => tracing::warn!(
+                    category = "running_observation_failed",
+                    "stale Running observation failed; no orphan replay was attempted"
+                ),
+            }
             let results = self.store.result_stored()?;
             let finalized = results.len();
             for attempt in results {
@@ -1492,6 +1621,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_running_without_local_state_is_observed_but_never_relaunched() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(0);
+
+        assert_eq!(
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(store.list_prepared().unwrap().is_empty());
+        // Private attempt authority, even for a prepared run, prevents the
+        // unrelated orphan alarm from claiming the task is unknown.
+        store.prepare("task-placeholder").unwrap();
+        assert_eq!(
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
+            0
+        );
+        notion.state.lock().unwrap().visible_status = Some("Done".to_owned());
+        assert_eq!(
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
+            0
+        );
+
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_running_task_is_not_marked_stale() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                notion,
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(10 * 365 * 24 * 60 * 60);
+        assert_eq!(
+            workflow
+                .count_stale_running_without_local_authority()
+                .await
+                .unwrap(),
+            0
+        );
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn automatic_retry_records_distinct_runs_and_verify_first_context() {
         let state_directory = directory();
         let store = Arc::new(
@@ -1536,6 +1759,51 @@ mod tests {
             notion.state.lock().unwrap().visible_status.as_deref(),
             Some("Error")
         );
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    struct QuotaExecutor {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Executor for QuotaExecutor {
+        fn execute(&self, request: ExecutorRequest) -> Result<ExecutorResult, String> {
+            self.calls.lock().unwrap().push(request.instructions);
+            Err("Codex executor quota exhausted".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_retries_outlive_generic_retry_limit_but_remain_bounded() {
+        let state_directory = directory();
+        let store = Arc::new(
+            AttemptStore::new(state_directory.clone())
+                .acquire()
+                .unwrap(),
+        );
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            QuotaExecutor {
+                calls: Arc::clone(&calls),
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_retry_policy(2, 0)
+        .with_quota_retry_policy(4, 0);
+        assert!(workflow.prepare(discovered("original")).await.is_err());
+        for _ in 0..4 {
+            assert!(workflow.recover().await.is_err());
+        }
+        assert_eq!(workflow.recover().await.unwrap(), 0);
+        assert_eq!(calls.lock().unwrap().len(), 5);
+        assert_eq!(store.list_prepared().unwrap().len(), 5);
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
