@@ -101,7 +101,7 @@ where
         let mode = if current.recovery_from_run_id().is_some() {
             "supervised orphan recovery; resume_reason=stale; previous outcome=unknown"
         } else {
-            "automatic executor retry; resume_reason=executor_error"
+            "automatic"
         };
         Ok(format!(
             "# RECOVERY ATTEMPT ({mode})\n\n\
