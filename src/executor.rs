@@ -263,7 +263,9 @@ fn quota_diagnostic(path: &Path) -> bool {
     };
     if !metadata.is_file()
         || file
-            .seek(SeekFrom::Start(metadata.len().saturating_sub(MAX_DIAGNOSTIC_BYTES)))
+            .seek(SeekFrom::Start(
+                metadata.len().saturating_sub(MAX_DIAGNOSTIC_BYTES),
+            ))
             .is_err()
     {
         return false;
@@ -418,7 +420,8 @@ mod tests {
         assert_eq!(failure, "Codex executor exited unsuccessfully");
         let _ = fs::remove_file(failure_program);
 
-        let quota_program = script("printf '%s\\n' 'Usage limit reached: secret-value' >&2; exit 1");
+        let quota_program =
+            script("printf '%s\\n' 'Usage limit reached: secret-value' >&2; exit 1");
         let quota = configured(quota_program.clone())
             .execute(ExecutorRequest {
                 instructions: "private instructions".to_owned(),

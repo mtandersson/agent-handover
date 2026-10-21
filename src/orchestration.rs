@@ -1803,7 +1803,10 @@ mod tests {
         assert_eq!(workflow.recover().await.unwrap(), 0);
         assert_eq!(calls.lock().unwrap().len(), 5);
         assert_eq!(store.list_prepared().unwrap().len(), 5);
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Error"));
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Error")
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
