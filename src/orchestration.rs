@@ -73,7 +73,11 @@ where
     // recovered Codex invocations the original brief plus explicit context,
     // including the crucial verify-before-write rule. Do not persist or log
     // task instruction text in local state.
-    fn instructions_for_attempt(&self, task: &DiscoveredTask) -> Result<String, String> {
+    fn instructions_for_attempt(
+        &self,
+        task: &DiscoveredTask,
+        current: &PreparedAttempt,
+    ) -> Result<String, String> {
         let previous = self
             .store
             .list_prepared()?
@@ -88,11 +92,19 @@ where
                     .cmp(&right.completed_at())
                     .then_with(|| left.run_id().cmp(right.run_id()))
             });
-        let Some(previous) = previous else {
+        let previous_run_id = current
+            .recovery_from_run_id()
+            .or_else(|| previous.as_ref().map(|attempt| attempt.run_id()));
+        let Some(previous_run_id) = previous_run_id else {
             return Ok(task.instructions.clone());
         };
+        let mode = if current.recovery_from_run_id().is_some() {
+            "supervised orphan recovery; resume_reason=stale; previous outcome=unknown"
+        } else {
+            "automatic executor retry; resume_reason=executor_error"
+        };
         Ok(format!(
-            "# RECOVERY ATTEMPT (automatic)\n\n\
+            "# RECOVERY ATTEMPT ({mode})\n\n\
              The previous Agent Handover run ID was: {}. Its outcome is \
              uncertain or failed. This is a new, separately journaled \
              attempt, not a continuation of that process.\n\n\
@@ -110,9 +122,74 @@ where
              human review; do not guess. Preserve source/staging files.\n\
              Follow all original scope, authorization and validation rules.\n\n\
              # ORIGINAL TASK\n\n{}",
-            previous.run_id(),
+            previous_run_id,
             task.instructions
         ))
+    }
+
+    /// Explicit operator-supervised adoption of a legacy Notion Running row.
+    /// The caller must hold the exclusive runner state lock and independently
+    /// prove the old executor stopped and review all downstream effects.
+    pub(crate) async fn recover_orphan(
+        &self,
+        page_id: &str,
+        previous_run_id: &str,
+    ) -> Result<(), String> {
+        if self.store.list_prepared()?.iter().any(|a| a.task_key() == page_id) {
+            return Err("orphan recovery refused: local attempt state exists".to_owned());
+        }
+        let task = self.notion.refetch_task(page_id).await?;
+        if task.page_id != page_id
+            || task.in_trash
+            || task.status.as_deref() != Some(self.task_values.running.as_str())
+        {
+            return Err("orphan recovery requires the same visible Running task".to_owned());
+        }
+        let min_age = time::Duration::seconds(
+            i64::try_from(self.stale_running_threshold_seconds).unwrap_or(i64::MAX),
+        );
+        if OffsetDateTime::now_utc() - task.revision.instant() < min_age {
+            return Err("orphan recovery refused: Running task is not stale".to_owned());
+        }
+        let prior = self
+            .notion
+            .find_journal_by_run_id(previous_run_id)
+            .await?
+            .ok_or_else(|| "orphan recovery requires the existing prior journal".to_owned())?;
+        if prior.run_id != previous_run_id
+            || prior.task_page_id != page_id
+            || prior.executor != self.executor_name
+        {
+            return Err("orphan recovery journal does not match the task".to_owned());
+        }
+        let started = OffsetDateTime::parse(&prior.started_at, &Rfc3339)
+            .map_err(|_| "orphan recovery prior journal timestamp is invalid".to_owned())?;
+        if OffsetDateTime::now_utc() - started < min_age {
+            return Err("orphan recovery refused: prior journal is not stale".to_owned());
+        }
+        if self
+            .notion
+            .find_final_journal_by_run_id(previous_run_id)
+            .await?
+            .is_some()
+        {
+            return Err("orphan recovery refused: original run already finalized".to_owned());
+        }
+        let instructions = self.notion.render_task(page_id).await?;
+        let current = self.notion.refetch_task(page_id).await?;
+        if current != task {
+            return Err("orphan recovery refused: task changed during verification".to_owned());
+        }
+        let prepared = self.store.prepare_orphan_recovery(
+            page_id,
+            task.revision.as_str(),
+            previous_run_id,
+        )?;
+        self.launch(
+            DiscoveredTask { state: task, instructions },
+            Some(prepared),
+        )
+        .await
     }
 
     fn is_automatic_retry_candidate(attempt: &PreparedAttempt) -> bool {
@@ -333,7 +410,7 @@ where
         tracing::info!("task attempt prepared");
         self.store.record_launch_intent(ready.run_id())?;
         let run_id = ready.run_id().to_owned();
-        let instructions = self.instructions_for_attempt(&task)?;
+        let instructions = self.instructions_for_attempt(&task, &ready.prepared)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
         let execution =
