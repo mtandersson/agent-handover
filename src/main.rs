@@ -65,8 +65,14 @@ impl Drop for EnrollmentSignalGuard {
 enum Command {
     Serve,
     RunOnce,
-    RecoverOrphan { task_page_id: String, previous_run_id: String },
-    WebhookEnroll { hostname: String, rotate: bool },
+    RecoverOrphan {
+        task_page_id: String,
+        previous_run_id: String,
+    },
+    WebhookEnroll {
+        hostname: String,
+        rotate: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,8 +88,10 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
         [] => Ok(Invocation::Help),
         [flag] if flag == "--help" || flag == "-h" => Ok(Invocation::Help),
         [command, flag]
-            if matches!(command.as_str(), "serve" | "run-once" | "recover-orphan" | "webhook-enroll")
-                && (flag == "--help" || flag == "-h") =>
+            if matches!(
+                command.as_str(),
+                "serve" | "run-once" | "recover-orphan" | "webhook-enroll"
+            ) && (flag == "--help" || flag == "-h") =>
         {
             Ok(Invocation::CommandHelp(match command.as_str() {
                 "serve" => "serve",
@@ -95,20 +103,27 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
         }
         [command] if command == "serve" => Ok(Invocation::Command(Command::Serve)),
         [command] if command == "run-once" => Ok(Invocation::Command(Command::RunOnce)),
-        [command, flag, page_id, previous_flag, previous_run_id, stopped, reviewed]
-            if command == "recover-orphan"
-                && flag == "--task-id"
-                && previous_flag == "--previous-run-id"
-                && stopped == "--confirm-executor-stopped"
-                && reviewed == "--confirm-effects-reviewed"
-                && !page_id.trim().is_empty()
-                && !previous_run_id.trim().is_empty() =>
+        [
+            command,
+            flag,
+            page_id,
+            previous_flag,
+            previous_run_id,
+            stopped,
+            reviewed,
+        ] if command == "recover-orphan"
+            && flag == "--task-id"
+            && previous_flag == "--previous-run-id"
+            && stopped == "--confirm-executor-stopped"
+            && reviewed == "--confirm-effects-reviewed"
+            && !page_id.trim().is_empty()
+            && !previous_run_id.trim().is_empty() =>
         {
             Ok(Invocation::Command(Command::RecoverOrphan {
                 task_page_id: page_id.clone(),
                 previous_run_id: previous_run_id.clone(),
             }))
-        },
+        }
         [command, flag, hostname] if command == "webhook-enroll" && flag == "--hostname" => {
             Ok(Invocation::Command(Command::WebhookEnroll {
                 hostname: hostname.clone(),
@@ -479,44 +494,47 @@ fn main() -> ExitCode {
                     })?;
                     Ok(run_once_response(count))
                 }),
-                Command::RecoverOrphan { task_page_id, previous_run_id } =>
-                    notion::NotionHttpClient::new(
-                        &config.notion,
-                        &config.task_properties,
-                        &config.journal_properties,
-                        &config.journal_values,
+                Command::RecoverOrphan {
+                    task_page_id,
+                    previous_run_id,
+                } => notion::NotionHttpClient::new(
+                    &config.notion,
+                    &config.task_properties,
+                    &config.journal_properties,
+                    &config.journal_values,
+                )
+                .and_then(|notion| {
+                    let runner_lock = std::sync::Arc::new(
+                        state::AttemptStore::new(paths.state_directory.clone()).acquire()?,
+                    );
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|_| "cannot initialize supervised recovery runtime".to_owned())?;
+                    let workflow = orchestration::ExecutionWorkflow::new(
+                        runner_lock,
+                        notion,
+                        executor::CodexExecutor::new(config.codex.clone()),
+                        config.task_values.clone(),
+                        config.journal_values.executor.clone(),
                     )
-                    .and_then(|notion| {
-                        let runner_lock = std::sync::Arc::new(
-                            state::AttemptStore::new(paths.state_directory.clone()).acquire()?,
-                        );
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|_| "cannot initialize supervised recovery runtime".to_owned())?;
-                        let workflow = orchestration::ExecutionWorkflow::new(
-                            runner_lock,
-                            notion,
-                            executor::CodexExecutor::new(config.codex.clone()),
-                            config.task_values.clone(),
-                            config.journal_values.executor.clone(),
-                        )
-                        .with_retry_policy(
-                            config.runner.auto_retry_max_retries,
-                            config.runner.auto_retry_delay_seconds,
-                        )
-                        .with_quota_retry_policy(
-                            config.runner.quota_retry_max_retries,
-                            config.runner.quota_retry_delay_seconds,
-                        )
-                        .with_stale_running_threshold_seconds(
-                            config.codex.timeout_seconds.saturating_add(
-                                config.runner.stale_running_grace_seconds,
-                            ),
-                        );
-                        runtime.block_on(workflow.recover_orphan(&task_page_id, &previous_run_id))?;
-                        Ok("supervised orphan recovery completed".to_owned())
-                    }),
+                    .with_retry_policy(
+                        config.runner.auto_retry_max_retries,
+                        config.runner.auto_retry_delay_seconds,
+                    )
+                    .with_quota_retry_policy(
+                        config.runner.quota_retry_max_retries,
+                        config.runner.quota_retry_delay_seconds,
+                    )
+                    .with_stale_running_threshold_seconds(
+                        config
+                            .codex
+                            .timeout_seconds
+                            .saturating_add(config.runner.stale_running_grace_seconds),
+                    );
+                    runtime.block_on(workflow.recover_orphan(&task_page_id, &previous_run_id))?;
+                    Ok("supervised orphan recovery completed".to_owned())
+                }),
                 Command::WebhookEnroll { .. } => unreachable!("enrollment handled without config"),
             })
         }),

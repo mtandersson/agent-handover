@@ -96,7 +96,11 @@ impl LockedAttemptStore {
     ) -> Result<PreparedAttempt, String> {
         validate_run_id(previous_run_id)?;
         validate_task_revision(task_revision)?;
-        if self.list_prepared()?.iter().any(|a| a.task_key() == task_key) {
+        if self
+            .list_prepared()?
+            .iter()
+            .any(|a| a.task_key() == task_key)
+        {
             return Err("orphan recovery refused: local attempt state exists".to_owned());
         }
         self.prepare_for_revision(task_key, Some(task_revision), Some(previous_run_id))
@@ -164,7 +168,10 @@ impl LockedAttemptStore {
                 .task_revision
                 .as_deref()
                 .is_some_and(|revision| validate_task_revision(revision).is_err())
-            || attempt.recovery_from_run_id.as_deref().is_some_and(|id| validate_run_id(id).is_err())
+            || attempt
+                .recovery_from_run_id
+                .as_deref()
+                .is_some_and(|id| validate_run_id(id).is_err())
             || !attempt.has_valid_state()
         {
             return Err("prepared attempt is invalid".to_owned());
@@ -837,14 +844,22 @@ mod tests {
                 .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
                 .unwrap();
             assert_eq!(prepared.recovery_from_run_id(), Some(previous_run_id));
-            assert!(store.prepare_orphan_recovery("task-placeholder", revision, previous_run_id).is_err());
+            assert!(
+                store
+                    .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                    .is_err()
+            );
             prepared.run_id().to_owned()
         };
         let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
         let recovered = reopened.load(&run_id).unwrap();
         assert_eq!(recovered.recovery_from_run_id(), Some(previous_run_id));
         assert_eq!(recovered.task_revision(), Some(revision));
-        assert!(reopened.prepare_orphan_recovery("task-placeholder", revision, previous_run_id).is_err());
+        assert!(
+            reopened
+                .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                .is_err()
+        );
         drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }

@@ -122,8 +122,7 @@ where
              human review; do not guess. Preserve source/staging files.\n\
              Follow all original scope, authorization and validation rules.\n\n\
              # ORIGINAL TASK\n\n{}",
-            previous_run_id,
-            task.instructions
+            previous_run_id, task.instructions
         ))
     }
 
@@ -135,7 +134,12 @@ where
         page_id: &str,
         previous_run_id: &str,
     ) -> Result<(), String> {
-        if self.store.list_prepared()?.iter().any(|a| a.task_key() == page_id) {
+        if self
+            .store
+            .list_prepared()?
+            .iter()
+            .any(|a| a.task_key() == page_id)
+        {
             return Err("orphan recovery refused: local attempt state exists".to_owned());
         }
         let task = self.notion.refetch_task(page_id).await?;
@@ -182,13 +186,14 @@ where
         if current != task {
             return Err("orphan recovery refused: task changed during verification".to_owned());
         }
-        let prepared = self.store.prepare_orphan_recovery(
-            page_id,
-            task.revision.as_str(),
-            previous_run_id,
-        )?;
+        let prepared =
+            self.store
+                .prepare_orphan_recovery(page_id, task.revision.as_str(), previous_run_id)?;
         self.launch(
-            DiscoveredTask { state: task, instructions },
+            DiscoveredTask {
+                state: task,
+                instructions,
+            },
             Some(prepared),
         )
         .await
@@ -1788,7 +1793,10 @@ mod tests {
             "Codex".to_owned(),
         )
         .with_stale_running_threshold_seconds(0);
-        workflow.recover_orphan("task-placeholder", previous).await.unwrap();
+        workflow
+            .recover_orphan("task-placeholder", previous)
+            .await
+            .unwrap();
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("RECOVERY ATTEMPT (supervised orphan recovery"));
@@ -1799,8 +1807,16 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
         assert_ne!(attempts[0].run_id(), previous);
-        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Done"));
-        assert!(workflow.recover_orphan("task-placeholder", previous).await.is_err());
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Done")
+        );
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", previous)
+                .await
+                .is_err()
+        );
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(directory).unwrap();
@@ -1825,7 +1841,12 @@ mod tests {
             "Codex".to_owned(),
         )
         .with_stale_running_threshold_seconds(3600);
-        assert!(workflow.recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111").await.is_err());
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111")
+                .await
+                .is_err()
+        );
         notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
         // Missing journal and a fake recent revision both fail closed.
         assert!(workflow.recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111").await.is_err());
