@@ -427,7 +427,7 @@ where
         // same durable-result boundary as a normal agent Error. Otherwise the
         // task stays Running until a runner restart, with an unfinished journal.
         // Never record arbitrary executor error text, which may contain secrets.
-        let (result, executor_failed) = match execution {
+        let (mut result, executor_failed) = match execution {
             Ok(Ok(result)) => (result, false),
             Ok(Err(reason)) => {
                 let category = match reason.as_str() {
@@ -468,6 +468,14 @@ where
                 )
             }
         };
+        // Link a supervised recovery to its original immutable run in the
+        // new result journal as well as in private attempt state. This exposes
+        // provenance to operators without modifying the previous journal.
+        if let Some(previous_run_id) = ready.prepared.recovery_from_run_id() {
+            result.warnings.push(format!(
+                "supervised recovery: resume_reason=stale; previous_run_id={previous_run_id}"
+            ));
+        }
         let outcome = result.outcome.clone();
         match outcome {
             Outcome::Done => tracing::info!(outcome = "done", "task executor finished"),
@@ -1806,6 +1814,12 @@ mod tests {
         let attempts = store.list_prepared().unwrap();
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
+        assert!(attempts[0]
+            .result()
+            .unwrap()
+            .warnings
+            .iter()
+            .any(|w| w.contains(previous)));
         assert_ne!(attempts[0].run_id(), previous);
         assert_eq!(
             notion.state.lock().unwrap().visible_status.as_deref(),
