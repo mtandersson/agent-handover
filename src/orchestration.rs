@@ -173,7 +173,11 @@ where
         }
         // The Notion adapter reports existing unfinished records with this
         // deterministic parse error; any other failure must block recovery.
-        match self.notion.find_final_journal_by_run_id(previous_run_id).await {
+        match self
+            .notion
+            .find_final_journal_by_run_id(previous_run_id)
+            .await
+        {
             Ok(Some(_)) => {
                 return Err("orphan recovery refused: original run already finalized".to_owned());
             }
@@ -1863,7 +1867,12 @@ mod tests {
         );
         notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
         // Missing journal and a fake recent revision both fail closed.
-        assert!(workflow.recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111").await.is_err());
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111")
+                .await
+                .is_err()
+        );
         assert!(calls.lock().unwrap().is_empty());
         assert!(store.list_prepared().unwrap().is_empty());
         drop(workflow);
