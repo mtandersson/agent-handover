@@ -65,6 +65,7 @@ impl Drop for EnrollmentSignalGuard {
 enum Command {
     Serve,
     RunOnce,
+    RecoverOrphan { task_page_id: String, previous_run_id: String },
     WebhookEnroll { hostname: String, rotate: bool },
 }
 
@@ -81,18 +82,33 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
         [] => Ok(Invocation::Help),
         [flag] if flag == "--help" || flag == "-h" => Ok(Invocation::Help),
         [command, flag]
-            if matches!(command.as_str(), "serve" | "run-once" | "webhook-enroll")
+            if matches!(command.as_str(), "serve" | "run-once" | "recover-orphan" | "webhook-enroll")
                 && (flag == "--help" || flag == "-h") =>
         {
             Ok(Invocation::CommandHelp(match command.as_str() {
                 "serve" => "serve",
                 "run-once" => "run-once",
+                "recover-orphan" => "recover-orphan",
                 "webhook-enroll" => "webhook-enroll",
                 _ => unreachable!("guard limits command names"),
             }))
         }
         [command] if command == "serve" => Ok(Invocation::Command(Command::Serve)),
         [command] if command == "run-once" => Ok(Invocation::Command(Command::RunOnce)),
+        [command, flag, page_id, previous_flag, previous_run_id, stopped, reviewed]
+            if command == "recover-orphan"
+                && flag == "--task-id"
+                && previous_flag == "--previous-run-id"
+                && stopped == "--confirm-executor-stopped"
+                && reviewed == "--confirm-effects-reviewed"
+                && !page_id.trim().is_empty()
+                && !previous_run_id.trim().is_empty() =>
+        {
+            Ok(Invocation::Command(Command::RecoverOrphan {
+                task_page_id: page_id.clone(),
+                previous_run_id: previous_run_id.clone(),
+            }))
+        },
         [command, flag, hostname] if command == "webhook-enroll" && flag == "--hostname" => {
             Ok(Invocation::Command(Command::WebhookEnroll {
                 hostname: hostname.clone(),
@@ -113,7 +129,7 @@ fn parse_command(args: &[String]) -> Result<Invocation, String> {
 }
 
 fn usage() -> String {
-    "usage: agent-handover [--help | --version | serve | run-once | webhook-enroll --hostname <HOST> [--rotate]]\n\
+    "usage: agent-handover [--help | --version | serve | run-once | recover-orphan --task-id <PAGE> --previous-run-id <RUN> --confirm-executor-stopped --confirm-effects-reviewed | webhook-enroll --hostname <HOST> [--rotate]]\n\
      Run `agent-handover --help` for setup and command guidance."
         .to_owned()
 }
@@ -146,6 +162,14 @@ Commands:
       Reconcile current Pending tasks once and execute them sequentially.
       Requires the host configuration. It does not require a webhook token or
       public tunnel.
+
+  recover-orphan --task-id <PAGE> --previous-run-id <RUN>
+      --confirm-executor-stopped --confirm-effects-reviewed
+      Stop the existing service and verify the old executor no longer runs.
+      Inspect all previous external effects before acknowledging both checks.
+      Requires host config and private runner-state lock, confirms an unfinished
+      journal and a stale Running row, then starts a separately journaled run.
+      No automatic replay when local authority is missing.
 
   webhook-enroll --hostname <HOST> [--rotate]
       Generate a secret callback URL, listen for one Notion verification POST
@@ -210,6 +234,20 @@ and public tunnel are not required.
 
 Options:
   -h, --help  Print this help"#
+        }
+        "recover-orphan" => {
+            r#"Supervised recovery of a legacy Running task with no local attempt state.
+
+Usage:
+  agent-handover recover-orphan --task-id <PAGE> --previous-run-id <RUN> \
+      --confirm-executor-stopped --confirm-effects-reviewed
+
+Stop the running service first. Verify the previous Codex process has stopped
+and inspect the old journal, target Notion/Drive effects and communications.
+Both acknowledgements are mandatory. The runner refuses non-stale tasks,
+mismatched/completed journals, existing local attempt state or a concurrent
+service. It creates a new durable attempt with recovery context and preserves
+the original journal."#
         }
         "webhook-enroll" => {
             r#"Enroll a Notion connection webhook token on this host.
@@ -441,6 +479,44 @@ fn main() -> ExitCode {
                     })?;
                     Ok(run_once_response(count))
                 }),
+                Command::RecoverOrphan { task_page_id, previous_run_id } =>
+                    notion::NotionHttpClient::new(
+                        &config.notion,
+                        &config.task_properties,
+                        &config.journal_properties,
+                        &config.journal_values,
+                    )
+                    .and_then(|notion| {
+                        let runner_lock = std::sync::Arc::new(
+                            state::AttemptStore::new(paths.state_directory.clone()).acquire()?,
+                        );
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|_| "cannot initialize supervised recovery runtime".to_owned())?;
+                        let workflow = orchestration::ExecutionWorkflow::new(
+                            runner_lock,
+                            notion,
+                            executor::CodexExecutor::new(config.codex.clone()),
+                            config.task_values.clone(),
+                            config.journal_values.executor.clone(),
+                        )
+                        .with_retry_policy(
+                            config.runner.auto_retry_max_retries,
+                            config.runner.auto_retry_delay_seconds,
+                        )
+                        .with_quota_retry_policy(
+                            config.runner.quota_retry_max_retries,
+                            config.runner.quota_retry_delay_seconds,
+                        )
+                        .with_stale_running_threshold_seconds(
+                            config.codex.timeout_seconds.saturating_add(
+                                config.runner.stale_running_grace_seconds,
+                            ),
+                        );
+                        runtime.block_on(workflow.recover_orphan(&task_page_id, &previous_run_id))?;
+                        Ok("supervised orphan recovery completed".to_owned())
+                    }),
                 Command::WebhookEnroll { .. } => unreachable!("enrollment handled without config"),
             })
         }),
@@ -494,7 +570,7 @@ mod tests {
 
     #[test]
     fn shows_help_for_each_command_with_either_help_flag() {
-        for command in ["serve", "run-once", "webhook-enroll"] {
+        for command in ["serve", "run-once", "recover-orphan", "webhook-enroll"] {
             let expected = Invocation::CommandHelp(command);
             assert_eq!(
                 parse_command(&[command.to_owned(), "-h".to_owned()]),
@@ -546,6 +622,29 @@ mod tests {
                 rotate: true
             }))
         );
+    }
+
+    #[test]
+    fn supervised_recovery_requires_both_operator_attestations() {
+        let args = vec![
+            "recover-orphan".to_owned(),
+            "--task-id".to_owned(),
+            "page-id".to_owned(),
+            "--previous-run-id".to_owned(),
+            "old-run-id".to_owned(),
+            "--confirm-executor-stopped".to_owned(),
+            "--confirm-effects-reviewed".to_owned(),
+        ];
+        assert_eq!(
+            parse_command(&args),
+            Ok(Invocation::Command(Command::RecoverOrphan {
+                task_page_id: "page-id".to_owned(),
+                previous_run_id: "old-run-id".to_owned(),
+            }))
+        );
+        assert!(parse_command(&args[..6]).is_err());
+        assert!(parse_command(&args[..5]).is_err());
+        assert!(command_help("recover-orphan").contains("acknowledgements are mandatory"));
     }
 
     #[test]
