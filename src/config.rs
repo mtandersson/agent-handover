@@ -356,6 +356,12 @@ pub struct RunnerConfig {
     pub auto_retry_max_retries: u8,
     #[serde(default = "default_auto_retry_delay_seconds")]
     pub auto_retry_delay_seconds: u64,
+    #[serde(default = "default_stale_running_grace_seconds")]
+    pub stale_running_grace_seconds: u64,
+    #[serde(default = "default_quota_retry_max_retries")]
+    pub quota_retry_max_retries: u16,
+    #[serde(default = "default_quota_retry_delay_seconds")]
+    pub quota_retry_delay_seconds: u64,
     pub bind_address: String,
     pub webhook_path: String,
     pub health_path: String,
@@ -367,6 +373,18 @@ fn default_auto_retry_max_retries() -> u8 {
 
 fn default_auto_retry_delay_seconds() -> u64 {
     900
+}
+
+fn default_stale_running_grace_seconds() -> u64 {
+    900
+}
+
+fn default_quota_retry_max_retries() -> u16 {
+    168
+}
+
+fn default_quota_retry_delay_seconds() -> u64 {
+    3600
 }
 
 /// The optional, locally managed Cloudflare Tunnel profile. Credentials must
@@ -754,6 +772,12 @@ fn validate(config: &Config) -> Result<(), String> {
     if config.runner.auto_retry_delay_seconds == 0 {
         return Err("runner.auto_retry_delay_seconds must be greater than zero".to_owned());
     }
+    if config.runner.quota_retry_max_retries > 336 {
+        return Err("runner.quota_retry_max_retries cannot exceed 336".to_owned());
+    }
+    if config.runner.quota_retry_delay_seconds == 0 {
+        return Err("runner.quota_retry_delay_seconds must be greater than zero".to_owned());
+    }
 
     let mut environment = HashSet::new();
     for (index, name) in config.codex.permitted_environment.iter().enumerate() {
@@ -971,6 +995,9 @@ health_path = "/health"
         .unwrap();
         assert_eq!(runner.auto_retry_max_retries, 2);
         assert_eq!(runner.auto_retry_delay_seconds, 900);
+        assert_eq!(runner.stale_running_grace_seconds, 900);
+        assert_eq!(runner.quota_retry_max_retries, 168);
+        assert_eq!(runner.quota_retry_delay_seconds, 3600);
         let opt_out: RunnerConfig = toml::from_str(
             r#"reconciliation_interval_seconds = 60
 auto_retry_max_retries = 0

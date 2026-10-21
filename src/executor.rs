@@ -2,7 +2,7 @@ use crate::config::CodexConfig;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_RESULT_BYTES: usize = 64 * 1024;
+const MAX_DIAGNOSTIC_BYTES: u64 = 16 * 1024;
 
 /// Provider-neutral boundary used by orchestration.  The task document is the
 /// complete instruction supplied to an executor; callers must not add prompt
@@ -83,13 +84,21 @@ impl Executor for CodexExecutor {
         let temporary = TemporaryFiles::create()?;
         fs::write(temporary.schema(), RESULT_SCHEMA)
             .map_err(|_| "cannot prepare Codex result schema".to_owned())?;
+        // Keep diagnostic text private and ephemeral; only derived categories escape.
+        let stderr_capture = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(temporary.stderr())
+            .map_err(|_| "cannot prepare Codex diagnostic capture".to_owned())?;
         let mut command = Command::new(&self.config.executable);
         command
             .args(self.arguments(&temporary.schema(), &temporary.output()))
             .current_dir(&self.config.working_directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr_capture))
             .process_group(0)
             .env_clear();
         for name in &self.config.permitted_environment {
@@ -113,6 +122,9 @@ impl Executor for CodexExecutor {
                 Ok(Some(false)) => {
                     terminate_process_group(&mut child, process_group);
                     let _ = writer.join();
+                    if quota_diagnostic(&temporary.stderr()) {
+                        return Err("Codex executor quota exhausted".to_owned());
+                    }
                     return Err("Codex executor exited unsuccessfully".to_owned());
                 }
                 Ok(Some(true)) => {
@@ -232,6 +244,54 @@ impl TemporaryFiles {
     fn output(&self) -> PathBuf {
         self.directory.join("result.json")
     }
+    fn stderr(&self) -> PathBuf {
+        self.directory.join("stderr.log")
+    }
+}
+
+// Read only the bounded stderr tail. Never persist, log or return its contents.
+fn quota_diagnostic(path: &Path) -> bool {
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file()
+        || file
+            .seek(SeekFrom::Start(
+                metadata.len().saturating_sub(MAX_DIAGNOSTIC_BYTES),
+            ))
+            .is_err()
+    {
+        return false;
+    }
+    let mut buffer = Vec::new();
+    if file
+        .take(MAX_DIAGNOSTIC_BYTES)
+        .read_to_end(&mut buffer)
+        .is_err()
+    {
+        return false;
+    }
+    let diagnostic = String::from_utf8_lossy(&buffer).to_ascii_lowercase();
+    [
+        "usage limit",
+        "usage cap",
+        "quota exceeded",
+        "quota_exceeded",
+        "insufficient_quota",
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "token limit reached",
+    ]
+    .iter()
+    .any(|signal| diagnostic.contains(signal))
 }
 
 impl Drop for TemporaryFiles {
@@ -359,6 +419,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure, "Codex executor exited unsuccessfully");
         let _ = fs::remove_file(failure_program);
+
+        let quota_program =
+            script("printf '%s\\n' 'Usage limit reached: secret-value' >&2; exit 1");
+        let quota = configured(quota_program.clone())
+            .execute(ExecutorRequest {
+                instructions: "private instructions".to_owned(),
+            })
+            .unwrap_err();
+        assert_eq!(quota, "Codex executor quota exhausted");
+        assert!(!quota.contains("secret-value"));
+        let _ = fs::remove_file(quota_program);
 
         let timeout_program = script("while :; do :; done");
         let timeout = configured(timeout_program.clone())
