@@ -73,7 +73,11 @@ where
     // recovered Codex invocations the original brief plus explicit context,
     // including the crucial verify-before-write rule. Do not persist or log
     // task instruction text in local state.
-    fn instructions_for_attempt(&self, task: &DiscoveredTask) -> Result<String, String> {
+    fn instructions_for_attempt(
+        &self,
+        task: &DiscoveredTask,
+        current: &PreparedAttempt,
+    ) -> Result<String, String> {
         let previous = self
             .store
             .list_prepared()?
@@ -88,11 +92,19 @@ where
                     .cmp(&right.completed_at())
                     .then_with(|| left.run_id().cmp(right.run_id()))
             });
-        let Some(previous) = previous else {
+        let previous_run_id = current
+            .recovery_from_run_id()
+            .or_else(|| previous.as_ref().map(|attempt| attempt.run_id()));
+        let Some(previous_run_id) = previous_run_id else {
             return Ok(task.instructions.clone());
         };
+        let mode = if current.recovery_from_run_id().is_some() {
+            "supervised orphan recovery; resume_reason=stale; previous outcome=unknown"
+        } else {
+            "automatic"
+        };
         Ok(format!(
-            "# RECOVERY ATTEMPT (automatic)\n\n\
+            "# RECOVERY ATTEMPT ({mode})\n\n\
              The previous Agent Handover run ID was: {}. Its outcome is \
              uncertain or failed. This is a new, separately journaled \
              attempt, not a continuation of that process.\n\n\
@@ -110,9 +122,85 @@ where
              human review; do not guess. Preserve source/staging files.\n\
              Follow all original scope, authorization and validation rules.\n\n\
              # ORIGINAL TASK\n\n{}",
-            previous.run_id(),
-            task.instructions
+            previous_run_id, task.instructions
         ))
+    }
+
+    /// Explicit operator-supervised adoption of a legacy Notion Running row.
+    /// The caller must hold the exclusive runner state lock and independently
+    /// prove the old executor stopped and review all downstream effects.
+    pub(crate) async fn recover_orphan(
+        &self,
+        page_id: &str,
+        previous_run_id: &str,
+    ) -> Result<(), String> {
+        if self
+            .store
+            .list_prepared()?
+            .iter()
+            .any(|a| a.task_key() == page_id)
+        {
+            return Err("orphan recovery refused: local attempt state exists".to_owned());
+        }
+        let task = self.notion.refetch_task(page_id).await?;
+        if task.page_id != page_id
+            || task.in_trash
+            || task.status.as_deref() != Some(self.task_values.running.as_str())
+        {
+            return Err("orphan recovery requires the same visible Running task".to_owned());
+        }
+        let min_age = time::Duration::seconds(
+            i64::try_from(self.stale_running_threshold_seconds).unwrap_or(i64::MAX),
+        );
+        if OffsetDateTime::now_utc() - task.revision.instant() < min_age {
+            return Err("orphan recovery refused: Running task is not stale".to_owned());
+        }
+        let prior = self
+            .notion
+            .find_journal_by_run_id(previous_run_id)
+            .await?
+            .ok_or_else(|| "orphan recovery requires the existing prior journal".to_owned())?;
+        if prior.run_id != previous_run_id
+            || prior.task_page_id != page_id
+            || prior.executor != self.executor_name
+        {
+            return Err("orphan recovery journal does not match the task".to_owned());
+        }
+        let started = OffsetDateTime::parse(&prior.started_at, &Rfc3339)
+            .map_err(|_| "orphan recovery prior journal timestamp is invalid".to_owned())?;
+        if OffsetDateTime::now_utc() - started < min_age {
+            return Err("orphan recovery refused: prior journal is not stale".to_owned());
+        }
+        // The Notion adapter reports existing unfinished records with this
+        // deterministic parse error; any other failure must block recovery.
+        match self
+            .notion
+            .find_final_journal_by_run_id(previous_run_id)
+            .await
+        {
+            Ok(Some(_)) => {
+                return Err("orphan recovery refused: original run already finalized".to_owned());
+            }
+            Ok(None) => {}
+            Err(ref error) if error == "Notion journal attempt is not finalized" => {}
+            Err(error) => return Err(error),
+        }
+        let instructions = self.notion.render_task(page_id).await?;
+        let current = self.notion.refetch_task(page_id).await?;
+        if current != task {
+            return Err("orphan recovery refused: task changed during verification".to_owned());
+        }
+        let prepared =
+            self.store
+                .prepare_orphan_recovery(page_id, task.revision.as_str(), previous_run_id)?;
+        self.launch(
+            DiscoveredTask {
+                state: task,
+                instructions,
+            },
+            Some(prepared),
+        )
+        .await
     }
 
     fn is_automatic_retry_candidate(attempt: &PreparedAttempt) -> bool {
@@ -333,7 +421,7 @@ where
         tracing::info!("task attempt prepared");
         self.store.record_launch_intent(ready.run_id())?;
         let run_id = ready.run_id().to_owned();
-        let instructions = self.instructions_for_attempt(&task)?;
+        let instructions = self.instructions_for_attempt(&task, &ready.prepared)?;
         let executor = Arc::clone(&self.executor);
         tracing::info!("task executor started");
         let execution =
@@ -343,7 +431,7 @@ where
         // same durable-result boundary as a normal agent Error. Otherwise the
         // task stays Running until a runner restart, with an unfinished journal.
         // Never record arbitrary executor error text, which may contain secrets.
-        let (result, executor_failed) = match execution {
+        let (mut result, executor_failed) = match execution {
             Ok(Ok(result)) => (result, false),
             Ok(Err(reason)) => {
                 let category = match reason.as_str() {
@@ -384,6 +472,14 @@ where
                 )
             }
         };
+        // Link a supervised recovery to its original immutable run in the
+        // new result journal as well as in private attempt state. This exposes
+        // provenance to operators without modifying the previous journal.
+        if let Some(previous_run_id) = ready.prepared.recovery_from_run_id() {
+            result.warnings.push(format!(
+                "supervised recovery: resume_reason=stale; previous_run_id={previous_run_id}"
+            ));
+        }
         let outcome = result.outcome.clone();
         match outcome {
             Outcome::Done => tracing::info!(outcome = "done", "task executor finished"),
@@ -1677,6 +1773,114 @@ mod tests {
         drop(workflow);
         drop(store);
         std::fs::remove_dir_all(state_directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn supervised_orphan_adoption_uses_read_before_write_and_new_journal() {
+        let directory = directory();
+        let store = Arc::new(AttemptStore::new(directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let previous = "11111111-1111-4111-8111-111111111111";
+        {
+            let mut state = notion.state.lock().unwrap();
+            state.visible_status = Some("Running".to_owned());
+            state.journal = Some(InitialJournalAttempt {
+                run_id: previous.to_owned(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            });
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(0);
+        workflow
+            .recover_orphan("task-placeholder", previous)
+            .await
+            .unwrap();
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(calls[0].contains("RECOVERY ATTEMPT (supervised orphan recovery"));
+            assert!(calls[0].contains(previous));
+            assert!(calls[0].contains("BEFORE ANY WRITE"));
+        }
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
+        assert!(
+            attempts[0]
+                .result()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|w| w.contains(previous))
+        );
+        assert_ne!(attempts[0].run_id(), previous);
+        assert_eq!(
+            notion.state.lock().unwrap().visible_status.as_deref(),
+            Some("Done")
+        );
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", previous)
+                .await
+                .is_err()
+        );
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_rejects_unknown_journal_and_live_running_row() {
+        let directory = directory();
+        let store = Arc::new(AttemptStore::new(directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(3600);
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111")
+                .await
+                .is_err()
+        );
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        // Missing journal and a fake recent revision both fail closed.
+        assert!(
+            workflow
+                .recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111")
+                .await
+                .is_err()
+        );
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(store.list_prepared().unwrap().is_empty());
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

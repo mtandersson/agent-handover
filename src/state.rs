@@ -34,6 +34,8 @@ pub(crate) struct PreparedAttempt {
     task_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     task_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_from_run_id: Option<String>,
     state: AttemptState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     completed_at: Option<String>,
@@ -72,7 +74,7 @@ impl AttemptStore {
 
 impl LockedAttemptStore {
     pub(crate) fn prepare(&self, task_key: &str) -> Result<PreparedAttempt, String> {
-        self.prepare_for_revision(task_key, None)
+        self.prepare_for_revision(task_key, None, None)
     }
 
     pub(crate) fn prepare_revision(
@@ -81,13 +83,34 @@ impl LockedAttemptStore {
         task_revision: &str,
     ) -> Result<PreparedAttempt, String> {
         validate_task_revision(task_revision)?;
-        self.prepare_for_revision(task_key, Some(task_revision))
+        self.prepare_for_revision(task_key, Some(task_revision), None)
+    }
+
+    /// Persist a supervised adoption marker before the new executor is launched.
+    /// The runner lock must be held by the sole authorized operator process.
+    pub(crate) fn prepare_orphan_recovery(
+        &self,
+        task_key: &str,
+        task_revision: &str,
+        previous_run_id: &str,
+    ) -> Result<PreparedAttempt, String> {
+        validate_run_id(previous_run_id)?;
+        validate_task_revision(task_revision)?;
+        if self
+            .list_prepared()?
+            .iter()
+            .any(|a| a.task_key() == task_key)
+        {
+            return Err("orphan recovery refused: local attempt state exists".to_owned());
+        }
+        self.prepare_for_revision(task_key, Some(task_revision), Some(previous_run_id))
     }
 
     fn prepare_for_revision(
         &self,
         task_key: &str,
         task_revision: Option<&str>,
+        recovery_from_run_id: Option<&str>,
     ) -> Result<PreparedAttempt, String> {
         validate_task_key(task_key)?;
         loop {
@@ -97,6 +120,7 @@ impl LockedAttemptStore {
                 run_id: run_id.clone(),
                 task_key: task_key.to_owned(),
                 task_revision: task_revision.map(str::to_owned),
+                recovery_from_run_id: recovery_from_run_id.map(str::to_owned),
                 state: AttemptState::Prepared,
                 completed_at: None,
                 result: None,
@@ -144,6 +168,10 @@ impl LockedAttemptStore {
                 .task_revision
                 .as_deref()
                 .is_some_and(|revision| validate_task_revision(revision).is_err())
+            || attempt
+                .recovery_from_run_id
+                .as_deref()
+                .is_some_and(|id| validate_run_id(id).is_err())
             || !attempt.has_valid_state()
         {
             return Err("prepared attempt is invalid".to_owned());
@@ -314,6 +342,10 @@ impl PreparedAttempt {
 
     pub(crate) fn completed_at(&self) -> Option<&str> {
         self.completed_at.as_deref()
+    }
+
+    pub(crate) fn recovery_from_run_id(&self) -> Option<&str> {
+        self.recovery_from_run_id.as_deref()
     }
 }
 
@@ -798,6 +830,37 @@ mod tests {
             assert!(!contents.contains(excluded));
         }
         drop(locked);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn supervised_orphan_provenance_survives_restart_and_blocks_duplicate_adoption() {
+        let directory = temporary_directory();
+        let previous_run_id = "11111111-1111-4111-8111-111111111111";
+        let revision = "2026-01-01T00:00:00Z";
+        let run_id = {
+            let store = AttemptStore::new(directory.clone()).acquire().unwrap();
+            let prepared = store
+                .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                .unwrap();
+            assert_eq!(prepared.recovery_from_run_id(), Some(previous_run_id));
+            assert!(
+                store
+                    .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                    .is_err()
+            );
+            prepared.run_id().to_owned()
+        };
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let recovered = reopened.load(&run_id).unwrap();
+        assert_eq!(recovered.recovery_from_run_id(), Some(previous_run_id));
+        assert_eq!(recovered.task_revision(), Some(revision));
+        assert!(
+            reopened
+                .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                .is_err()
+        );
+        drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }
 
