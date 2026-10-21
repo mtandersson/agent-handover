@@ -1757,6 +1757,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn supervised_orphan_adoption_uses_read_before_write_and_new_journal() {
+        let directory = directory();
+        let store = Arc::new(AttemptStore::new(directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let previous = "11111111-1111-4111-8111-111111111111";
+        {
+            let mut state = notion.state.lock().unwrap();
+            state.visible_status = Some("Running".to_owned());
+            state.journal = Some(InitialJournalAttempt {
+                run_id: previous.to_owned(),
+                task_page_id: "task-placeholder".to_owned(),
+                executor: "Codex".to_owned(),
+                started_at: "2026-01-01T00:00:00Z".to_owned(),
+            });
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(0);
+        workflow.recover_orphan("task-placeholder", previous).await.unwrap();
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("RECOVERY ATTEMPT (supervised orphan recovery"));
+        assert!(calls[0].contains(previous));
+        assert!(calls[0].contains("BEFORE ANY WRITE"));
+        drop(calls);
+        let attempts = store.list_prepared().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].recovery_from_run_id(), Some(previous));
+        assert_ne!(attempts[0].run_id(), previous);
+        assert_eq!(notion.state.lock().unwrap().visible_status.as_deref(), Some("Done"));
+        assert!(workflow.recover_orphan("task-placeholder", previous).await.is_err());
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_recovery_rejects_unknown_journal_and_live_running_row() {
+        let directory = directory();
+        let store = Arc::new(AttemptStore::new(directory.clone()).acquire().unwrap());
+        let notion = FakeNotion::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let workflow = ExecutionWorkflow::new(
+            Arc::clone(&store),
+            notion.clone(),
+            FakeExecutor {
+                calls: Arc::clone(&calls),
+                notion: notion.clone(),
+                fail: false,
+                outcome: Outcome::Done,
+            },
+            values(),
+            "Codex".to_owned(),
+        )
+        .with_stale_running_threshold_seconds(3600);
+        assert!(workflow.recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111").await.is_err());
+        notion.state.lock().unwrap().visible_status = Some("Running".to_owned());
+        // Missing journal and a fake recent revision both fail closed.
+        assert!(workflow.recover_orphan("task-placeholder", "11111111-1111-4111-8111-111111111111").await.is_err());
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(store.list_prepared().unwrap().is_empty());
+        drop(workflow);
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn recent_running_task_is_not_marked_stale() {
         let state_directory = directory();
         let store = Arc::new(

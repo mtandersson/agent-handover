@@ -827,6 +827,29 @@ mod tests {
     }
 
     #[test]
+    fn supervised_orphan_provenance_survives_restart_and_blocks_duplicate_adoption() {
+        let directory = temporary_directory();
+        let previous_run_id = "11111111-1111-4111-8111-111111111111";
+        let revision = "2026-01-01T00:00:00Z";
+        let run_id = {
+            let store = AttemptStore::new(directory.clone()).acquire().unwrap();
+            let prepared = store
+                .prepare_orphan_recovery("task-placeholder", revision, previous_run_id)
+                .unwrap();
+            assert_eq!(prepared.recovery_from_run_id(), Some(previous_run_id));
+            assert!(store.prepare_orphan_recovery("task-placeholder", revision, previous_run_id).is_err());
+            prepared.run_id().to_owned()
+        };
+        let reopened = AttemptStore::new(directory.clone()).acquire().unwrap();
+        let recovered = reopened.load(&run_id).unwrap();
+        assert_eq!(recovered.recovery_from_run_id(), Some(previous_run_id));
+        assert_eq!(recovered.task_revision(), Some(revision));
+        assert!(reopened.prepare_orphan_recovery("task-placeholder", revision, previous_run_id).is_err());
+        drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn state_diagnostics_do_not_expose_host_specific_paths() {
         let directory = temporary_directory();
         let state_path = directory.join("host-specific-value");

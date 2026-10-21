@@ -505,6 +505,48 @@ the enrolled callback UUID and token:
 agent-handover webhook-enroll --hostname handover.example.com --rotate
 ```
 
+### Supervised recovery of a legacy orphan
+
+PR #107 detects `Running` rows lacking private local attempt authority but
+cannot prove that their former Codex processes have stopped. The runner **never**
+automatically replays those rows based on age alone. Issue #105 adds a
+controlled, recoverable adoption path for an operator physically verifying the
+private host state.
+
+1. Check which `agent-handover --version` runs on Eva, which executable is
+   launched by the service, and whether it was deployed after merging the fix.
+2. Stop the existing `serve` service before recovery. Inspect the old Run
+   Journal, the process tree for existing Codex work, and the private local
+   `XDG_STATE_HOME/agent-handover/attempts` directory (fallback:
+   `~/.local/state/agent-handover/attempts`). Do not proceed until you have
+   independently established the old executor is dead. The private runner
+   lock also refuses concurrent services, but does not prove detached child
+   processes are gone.
+3. Examine the **actual** downstream state, including Notion native image and
+   caption, Drive staging files, external messages and prior writes. If work
+   completed, do not replay it. If duplication/non-idempotency is uncertain,
+   leave it for manual review. Keep original files and journal unchanged.
+4. Only if the task is truly incomplete and safe to resume, use the *same*
+   configured Notion connection and local host authority:
+
+   ```sh
+   agent-handover recover-orphan --task-id PAGE_UUID \\
+     --previous-run-id PREVIOUS_RUN_UUID \\
+     --confirm-executor-stopped --confirm-effects-reviewed
+   ```
+
+   Both flags attest **checks already done**. The command validates the old
+   unfinished journal, executor identity, stale `Running` status, original
+   task revision and absence of local authority. It saves a new UUID and old
+   run reference durably, then starts Codex with a `RECOVERY ATTEMPT` preamble
+   requiring read-before-write; original journal history is retained. If the
+   process dies after preparation, the next `serve` or `run-once` will
+   resume safely using the persisted context. Do not rerun the command after
+   a failure; inspect the new journal and local records first.
+5. Verify new journal result and target state before returning the service
+   to normal operation. Never reset `Running` to `Pending` blindly. Existing
+   2026-09/10 incidents require this host-by-host confirmation.
+
 ### Automatic recovery of interrupted and failed attempts
 
 The runner durably journals **every** executor outcome, including Codex process
