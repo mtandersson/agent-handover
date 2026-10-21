@@ -167,13 +167,15 @@ where
         if OffsetDateTime::now_utc() - started < min_age {
             return Err("orphan recovery refused: prior journal is not stale".to_owned());
         }
-        if self
-            .notion
-            .find_final_journal_by_run_id(previous_run_id)
-            .await?
-            .is_some()
-        {
-            return Err("orphan recovery refused: original run already finalized".to_owned());
+        // The Notion adapter reports existing unfinished records with this
+        // deterministic parse error; any other failure must block recovery.
+        match self.notion.find_final_journal_by_run_id(previous_run_id).await {
+            Ok(Some(_)) => {
+                return Err("orphan recovery refused: original run already finalized".to_owned());
+            }
+            Ok(None) => {}
+            Err(ref error) if error == "Notion journal attempt is not finalized" => {}
+            Err(error) => return Err(error),
         }
         let instructions = self.notion.render_task(page_id).await?;
         let current = self.notion.refetch_task(page_id).await?;
