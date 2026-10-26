@@ -1,3 +1,18 @@
+## [0.13.1](https://github.com/mtandersson/agent-handover/compare/v0.13.0...v0.13.1) (2026-10-26)
+
+### Bug Fixes
+
+* **recovery:** observe orphaned tasks and retry Codex quota exhaustion ([#105](https://github.com/mtandersson/agent-handover/issues/105)) ([b6095eb](https://github.com/mtandersson/agent-handover/commit/b6095eb195328cd87281c02e9e0e11e7be138cf4))
+* **recovery:** safely adopt legacy orphaned Running tasks ([#105](https://github.com/mtandersson/agent-handover/issues/105)) ([ea52646](https://github.com/mtandersson/agent-handover/commit/ea526467fa85aeb68a379c65739363b5fc22a928))
+
+### Chores
+
+* **deps:** update rust crate tokio to v1.54.0 ([#116](https://github.com/mtandersson/agent-handover/issues/116)) ([14388f8](https://github.com/mtandersson/agent-handover/commit/14388f84493cf0f5d94683f419f1eaa3567d10f1))
+* **deps:** update rust crate tokio to v1.54.1 ([#118](https://github.com/mtandersson/agent-handover/issues/118)) ([56f3de5](https://github.com/mtandersson/agent-handover/commit/56f3de51173c1ce40ee39b8e46bbc3b7169e423b))
+* **deps:** update rust crate uuid to v1.29.0 ([#120](https://github.com/mtandersson/agent-handover/issues/120)) ([ef1255a](https://github.com/mtandersson/agent-handover/commit/ef1255a4db155678b40f8e60f486bdd945d48c7d))
+* **deps:** update rust crate webpki-root-certs to v1.0.10 ([#115](https://github.com/mtandersson/agent-handover/issues/115)) ([1c249f3](https://github.com/mtandersson/agent-handover/commit/1c249f303676df022b9942ec6e946a04050eb28a))
+* **deps:** update rust crate webpki-root-certs to v1.0.11 ([#119](https://github.com/mtandersson/agent-handover/issues/119)) ([0195688](https://github.com/mtandersson/agent-handover/commit/01956886ee3b881d80b78fb6c3a60d9ca279acb8))
+
 ## [0.13.0](https://github.com/mtandersson/agent-handover/compare/v0.12.0...v0.13.0) (2026-10-19)
 
 ### Features
